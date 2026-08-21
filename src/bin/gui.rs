@@ -1,6 +1,6 @@
 use adw::gtk::{self, gdk, glib};
 use adw::prelude::*;
-use adw::{Application, ApplicationWindow, HeaderBar, ToolbarView};
+use adw::{Application, ApplicationWindow, Clamp, HeaderBar, ToolbarView};
 use libadwaita as adw;
 use liquid_glass_icon::{
     AppCategory, Appearance,
@@ -57,6 +57,7 @@ fn main() {
                 return;
             }
         };
+        install_css();
         build_window(application, state);
     });
     application.run();
@@ -216,6 +217,7 @@ impl IconApp {
                 .subtitle(subtitle.as_str())
                 .activatable(true)
                 .build();
+            row.add_css_class("app-row");
             if let Some(path) = &application.icon_path {
                 let image = gtk::Image::from_file(path);
                 image.set_pixel_size(32);
@@ -483,10 +485,11 @@ impl IconApp {
             .iter()
             .enumerate()
             .filter_map(|(index, task)| {
-                matches!(
-                    task.state,
-                    DesktopTaskState::Converted | DesktopTaskState::Completed
-                )
+                (self.visible(index)
+                    && matches!(
+                        task.state,
+                        DesktopTaskState::Converted | DesktopTaskState::Completed
+                    ))
                 .then_some(index)
             })
             .collect::<Vec<_>>();
@@ -494,6 +497,85 @@ impl IconApp {
             let _ = self.apply_icon(index);
         }
     }
+}
+
+const UI_CSS: &str = r#"
+.content-root {
+  padding: 24px;
+}
+
+.hero {
+  padding: 2px 4px 0;
+}
+
+.hero-title {
+  font-size: 26px;
+  font-weight: 700;
+}
+
+.hero-subtitle,
+.section-caption,
+.field-label {
+  color: alpha(@window_fg_color, 0.64);
+}
+
+.card {
+  background-color: alpha(@card_bg_color, 0.92);
+  border: 1px solid alpha(@window_fg_color, 0.08);
+  border-radius: 18px;
+  padding: 16px;
+}
+
+.section-title {
+  font-size: 15px;
+  font-weight: 700;
+}
+
+.counter,
+.status-pill {
+  background-color: alpha(@accent_bg_color, 0.16);
+  border-radius: 999px;
+  color: @accent_color;
+  padding: 5px 10px;
+}
+
+.preview-surface {
+  background-color: @view_bg_color;
+  border-radius: 16px;
+  padding: 12px;
+}
+
+.app-row {
+  padding-top: 4px;
+  padding-bottom: 4px;
+}
+"#;
+
+fn install_css() {
+    let Some(display) = gdk::Display::default() else {
+        return;
+    };
+    let provider = gtk::CssProvider::new();
+    provider.load_from_data(UI_CSS);
+    gtk::style_context_add_provider_for_display(
+        &display,
+        &provider,
+        gtk::STYLE_PROVIDER_PRIORITY_APPLICATION,
+    );
+}
+
+fn section_label(text: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.set_halign(gtk::Align::Start);
+    label.add_css_class("section-title");
+    label
+}
+
+fn field_label(text: &str) -> gtk::Label {
+    let label = gtk::Label::new(Some(text));
+    label.set_halign(gtk::Align::Start);
+    label.add_css_class("field-label");
+    label
 }
 
 fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
@@ -511,9 +593,12 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     preview.set_content_fit(gtk::ContentFit::Contain);
     preview.set_hexpand(true);
     preview.set_vexpand(true);
-    preview.set_size_request(520, 520);
+    preview.set_size_request(480, 480);
     preview_title.add_css_class("title-2");
     status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+    status.add_css_class("status-pill");
+    let count = state.borrow().count.clone();
+    count.add_css_class("counter");
 
     let provider = gtk::DropDown::from_strings(&["Codex exec", "API key"]);
     let model = gtk::DropDown::from_strings(&MODEL_OPTIONS);
@@ -590,53 +675,121 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     categories.set_label("Categories");
     categories.set_popover(Some(&category_popover));
 
-    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    controls.set_margin_top(6);
-    controls.set_margin_bottom(6);
-    controls.set_margin_start(12);
-    controls.set_margin_end(12);
-    controls.append(&provider);
-    controls.append(&api_key);
-    controls.append(&model);
-    controls.append(&generate);
-    controls.append(&stop);
-    controls.append(&categories);
+    provider.set_hexpand(true);
+    model.set_hexpand(true);
+    api_key.set_hexpand(true);
+    theme.set_hexpand(true);
+    appearance.set_hexpand(true);
 
-    let settings = gtk::Box::new(gtk::Orientation::Horizontal, 6);
-    settings.set_margin_top(6);
-    settings.set_margin_bottom(6);
-    settings.set_margin_start(12);
-    settings.set_margin_end(12);
-    settings.append(&gtk::Label::new(Some("Theme")));
-    settings.append(&theme);
-    settings.append(&gtk::Label::new(Some("Material")));
-    settings.append(&appearance);
-    settings.append(&gtk::Label::new(Some("Global accent")));
-    settings.append(&color);
+    let controls = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    controls.add_css_class("card");
+    controls.append(&section_label("Conversion"));
+    let controls_grid = gtk::Grid::new();
+    controls_grid.set_column_spacing(12);
+    controls_grid.set_row_spacing(10);
+    controls_grid.attach(&field_label("Provider"), 0, 0, 1, 1);
+    controls_grid.attach(&provider, 1, 0, 1, 1);
+    controls_grid.attach(&field_label("Model"), 2, 0, 1, 1);
+    controls_grid.attach(&model, 3, 0, 1, 1);
+    controls_grid.attach(&field_label("API key"), 0, 1, 1, 1);
+    controls_grid.attach(&api_key, 1, 1, 3, 1);
+    let actions = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    actions.set_halign(gtk::Align::End);
+    actions.append(&generate);
+    actions.append(&stop);
+    actions.append(&categories);
+    controls_grid.attach(&actions, 0, 2, 4, 1);
+    controls.append(&controls_grid);
+
+    let settings = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    settings.add_css_class("card");
+    settings.append(&section_label("Appearance"));
+    let settings_grid = gtk::Grid::new();
+    settings_grid.set_column_spacing(12);
+    settings_grid.set_row_spacing(10);
+    settings_grid.attach(&field_label("Theme"), 0, 0, 1, 1);
+    settings_grid.attach(&theme, 1, 0, 1, 1);
+    settings_grid.attach(&field_label("Material"), 2, 0, 1, 1);
+    settings_grid.attach(&appearance, 3, 0, 1, 1);
+    settings_grid.attach(&field_label("Global accent"), 4, 0, 1, 1);
+    settings_grid.attach(&color, 5, 0, 1, 1);
+    settings.append(&settings_grid);
 
     let list_scroll = gtk::ScrolledWindow::builder()
         .vexpand(true)
-        .min_content_width(390)
+        .hexpand(true)
+        .min_content_width(430)
         .child(&list)
         .build();
-    let right = gtk::Box::new(gtk::Orientation::Vertical, 12);
-    right.set_margin_top(18);
-    right.set_margin_bottom(18);
-    right.set_margin_start(18);
-    right.set_margin_end(18);
-    right.append(&preview_title);
-    right.append(&preview);
-    let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
-    content.append(&list_scroll);
+    let list_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    list_header.append(&section_label("Applications"));
+    list_header.append(&count);
+    let list_panel = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    list_panel.add_css_class("card");
+    list_panel.set_vexpand(true);
+    list_panel.set_size_request(440, -1);
+    list_panel.append(&list_header);
+    list_panel.append(&list_scroll);
+
+    let preview_caption = gtk::Label::new(Some("Runtime material preview · local WGPU renderer"));
+    preview_caption.add_css_class("section-caption");
+    preview_caption.set_halign(gtk::Align::Start);
+    let preview_heading = gtk::Box::new(gtk::Orientation::Vertical, 3);
+    preview_heading.append(&preview_title);
+    preview_heading.append(&preview_caption);
+    let preview_surface = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    preview_surface.add_css_class("preview-surface");
+    preview_surface.set_vexpand(true);
+    preview_surface.append(&preview);
+    let right = gtk::Box::new(gtk::Orientation::Vertical, 14);
+    right.add_css_class("card");
+    right.set_hexpand(true);
+    right.set_vexpand(true);
+    right.append(&preview_heading);
+    right.append(&preview_surface);
+
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 18);
+    content.set_vexpand(true);
+    content.append(&list_panel);
     content.append(&right);
 
-    let top = gtk::Box::new(gtk::Orientation::Vertical, 0);
-    top.append(&controls);
-    top.append(&settings);
-    top.append(&content);
+    let hero = gtk::Box::new(gtk::Orientation::Vertical, 4);
+    hero.add_css_class("hero");
+    let hero_title = gtk::Label::new(Some("Make your app grid feel intentional"));
+    hero_title.set_halign(gtk::Align::Start);
+    hero_title.add_css_class("hero-title");
+    let hero_subtitle = gtk::Label::new(Some(
+        "Convert each icon once, then tune the glass locally without another AI request.",
+    ));
+    hero_subtitle.set_halign(gtk::Align::Start);
+    hero_subtitle.add_css_class("hero-subtitle");
+    hero.append(&hero_title);
+    hero.append(&hero_subtitle);
+
+    let root = gtk::Box::new(gtk::Orientation::Vertical, 18);
+    root.add_css_class("content-root");
+    root.append(&hero);
+    root.append(&controls);
+    root.append(&settings);
+    root.append(&content);
+    root.append(&status);
+    let clamp = Clamp::new();
+    clamp.set_maximum_size(1480);
+    clamp.set_tightening_threshold(1000);
+    clamp.set_child(Some(&root));
+
+    let header_title = gtk::Label::new(Some("Liquid Glass Icons"));
+    header_title.add_css_class("title-4");
+    let header_subtitle = gtk::Label::new(Some("Layered app icon studio"));
+    header_subtitle.add_css_class("dim-label");
+    let header_stack = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    header_stack.append(&header_title);
+    header_stack.append(&header_subtitle);
+    let header = HeaderBar::new();
+    header.set_title_widget(Some(&header_stack));
     let toolbar = ToolbarView::new();
-    toolbar.add_top_bar(&HeaderBar::new());
-    toolbar.set_content(Some(&top));
+    toolbar.add_top_bar(&header);
+    toolbar.set_content(Some(&clamp));
     let window = ApplicationWindow::builder()
         .application(application)
         .title("Liquid Glass Icons")

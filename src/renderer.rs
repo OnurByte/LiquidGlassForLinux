@@ -203,8 +203,28 @@ impl GlassRenderer {
         }
         drop(mapped);
         readback.unmap();
-        RgbaImage::from_raw(width, height, pixels)
-            .ok_or_else(|| gpu_error("GPU returned an invalid RGBA image"))
+        let mut image = RgbaImage::from_raw(width, height, pixels)
+            .ok_or_else(|| gpu_error("GPU returned an invalid RGBA image"))?;
+        if target == RenderTarget::Icon {
+            apply_icon_mask(&mut image);
+        }
+        Ok(image)
+    }
+}
+
+fn apply_icon_mask(image: &mut RgbaImage) {
+    let width = image.width() as f32;
+    let height = image.height() as f32;
+    for (x, y, pixel) in image.enumerate_pixels_mut() {
+        let uv_x = (x as f32 + 0.5) / width;
+        let uv_y = (y as f32 + 0.5) / height;
+        let p_x = ((uv_x - 0.5) / 0.415).abs().powf(4.2);
+        let p_y = ((uv_y - 0.5) / 0.415).abs().powf(4.2);
+        let distance = p_x + p_y;
+        let edge = ((distance - 0.90) / 0.10).clamp(0.0, 1.0);
+        let edge = edge * edge * (3.0 - 2.0 * edge);
+        let mask = 1.0 - edge;
+        pixel[3] = (f32::from(pixel[3]) * mask).round() as u8;
     }
 }
 
@@ -663,5 +683,9 @@ mod tests {
             .render(128, 128, RenderSettings::default(), RenderTarget::Icon)
             .unwrap();
         assert!(image.get_pixel(64, 64)[3] > 0);
+        assert_eq!(image.get_pixel(0, 0)[3], 0);
+        assert_eq!(image.get_pixel(127, 0)[3], 0);
+        assert_eq!(image.get_pixel(0, 127)[3], 0);
+        assert_eq!(image.get_pixel(127, 127)[3], 0);
     }
 }

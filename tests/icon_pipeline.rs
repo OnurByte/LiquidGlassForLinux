@@ -417,6 +417,12 @@ async fn local_renderer_application_writes_real_linux_icon_sizes() {
         .find_map(|line| line.strip_prefix("Icon="))
         .unwrap();
     assert_ne!(first_icon, second_icon);
+    for size in [128, 256, 512] {
+        let stale_path = data_home
+            .join("icons/hicolor")
+            .join(format!("{size}x{size}/apps/{first_icon}.png"));
+        assert!(!stale_path.exists());
+    }
 }
 
 #[tokio::test]

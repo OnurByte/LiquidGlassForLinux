@@ -115,6 +115,14 @@ impl IconInstaller {
         let rewritten = replace_desktop_icon(&source, icon_name, &application.icon_name)?;
         write_bytes_atomically(&override_path, rewritten.as_bytes())?;
         let managed_sha256 = crate::manifest::sha256(rewritten.as_bytes());
+        let current_file_names = icon_files
+            .iter()
+            .filter_map(|path| {
+                path.file_name()
+                    .and_then(|name| name.to_str())
+                    .map(str::to_owned)
+            })
+            .collect::<Vec<_>>();
         state.entries.insert(
             application.id.clone(),
             ManagedIcon {
@@ -133,6 +141,10 @@ impl IconInstaller {
                 }
             }
         }
+        self.remove_icon_family(
+            &application_output_name(&application.id),
+            &current_file_names,
+        );
         refresh_desktop_caches(&self.data_home);
         Ok(())
     }
@@ -159,6 +171,7 @@ impl IconInstaller {
         for path in entry.icon_files {
             let _ = fs::remove_file(path);
         }
+        self.remove_icon_family(&application_output_name(&entry.desktop_id), &[]);
         write_state(&state_path, &state)?;
         refresh_desktop_caches(&self.data_home);
         Ok(())
@@ -175,6 +188,31 @@ impl IconInstaller {
             .join("icons/hicolor")
             .join(format!("{size}x{size}/apps"))
             .join(format!("{icon_name}.png"))
+    }
+
+    fn remove_icon_family(&self, output_name: &str, keep: &[String]) {
+        let prefix = format!("liquid-glass-{output_name}-");
+        for size in ICON_SIZES {
+            let directory = self
+                .data_home
+                .join("icons/hicolor")
+                .join(format!("{size}x{size}/apps"));
+            let Ok(entries) = fs::read_dir(directory) else {
+                continue;
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Some(name) = path.file_name().and_then(|name| name.to_str()) else {
+                    continue;
+                };
+                if path.is_file()
+                    && name.starts_with(&prefix)
+                    && !keep.iter().any(|keep| keep == name)
+                {
+                    let _ = fs::remove_file(path);
+                }
+            }
+        }
     }
 
     fn state_path(&self) -> PathBuf {
