@@ -38,6 +38,8 @@ Clear, Tinted or preview motion never sends another AI request.
 - Default model: `gpt-5.6-luna`, with model selection in the GUI and CLI.
 - One conversion request per icon, cached by source hash and manifest version.
 - One 1024×1024 SVG: an opaque background plus one to four foreground layers.
+- Small AI geometry spills past the canvas are clipped during rasterization and
+  then fitted into the safe area automatically.
 - Local WGPU material pass with depth, layer separation, safe-area fitting,
   refraction, shadows, specular response, Default/Dark/Clear/Tinted looks and
   one global accent.

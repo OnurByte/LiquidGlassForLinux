@@ -12,7 +12,7 @@
   },
   "generator": {
     "providers": ["codex-exec", "responses-api"],
-    "promptVersion": 3,
+    "promptVersion": 5,
     "requestsPerConversionAttempt": 1
   },
   "renderer": {

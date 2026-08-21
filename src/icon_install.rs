@@ -55,10 +55,22 @@ impl IconInstaller {
         settings: RenderSettings,
     ) -> Result<(), IconError> {
         renderer.load_svg(svg)?;
-        let icon_name = format!("liquid-glass-{}", application_output_name(&application.id));
+        let rendered = ICON_SIZES
+            .into_iter()
+            .map(|size| {
+                renderer
+                    .render(size, size, settings, RenderTarget::Icon)
+                    .map(|image| (size, image))
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let fingerprint = crate::manifest::sha256(rendered[1].1.as_raw());
+        let icon_name = format!(
+            "liquid-glass-{}-{}",
+            application_output_name(&application.id),
+            &fingerprint[..12]
+        );
         let mut icon_files = Vec::new();
-        for size in ICON_SIZES {
-            let image = renderer.render(size, size, settings, RenderTarget::Icon)?;
+        for (size, image) in rendered {
             let path = self.icon_path(&icon_name, size);
             write_png_atomically(&path, &image)?;
             icon_files.push(path);
@@ -77,6 +89,10 @@ impl IconInstaller {
         let state_path = self.state_path();
         let mut state = read_state(&state_path)?;
         let previous = state.entries.get(&application.id).cloned();
+        let previous_icon_files = previous
+            .as_ref()
+            .map(|entry| entry.icon_files.clone())
+            .unwrap_or_default();
 
         let (source, backup_path) = if override_path.is_file() {
             let contents = fs::read_to_string(&override_path)?;
@@ -88,7 +104,9 @@ impl IconInstaller {
                 write_bytes_atomically(&path, contents.as_bytes())?;
                 Some(path)
             } else {
-                previous.and_then(|entry| entry.backup_path)
+                previous
+                    .as_ref()
+                    .and_then(|entry| entry.backup_path.clone())
             };
             (contents, backup_path)
         } else {
@@ -108,6 +126,13 @@ impl IconInstaller {
             },
         );
         write_state(&state_path, &state)?;
+        if let Some(current) = state.entries.get(&application.id) {
+            for path in previous_icon_files {
+                if !current.icon_files.contains(&path) {
+                    let _ = fs::remove_file(path);
+                }
+            }
+        }
         refresh_desktop_caches(&self.data_home);
         Ok(())
     }
@@ -249,13 +274,14 @@ fn write_bytes_atomically(path: &Path, bytes: &[u8]) -> Result<(), IconError> {
 fn refresh_desktop_caches(data_home: &Path) {
     let icon_root = data_home.join("icons/hicolor");
     let applications = data_home.join("applications");
-    if icon_root.join("index.theme").is_file() {
+    if icon_root.is_dir() {
         let _ = Command::new("gtk4-update-icon-cache")
-            .args(["-f", "-t"])
+            .args(["-q", "-f", "-t"])
             .arg(icon_root)
             .status();
     }
     let _ = Command::new("update-desktop-database")
+        .arg("-q")
         .arg(applications)
         .status();
 }

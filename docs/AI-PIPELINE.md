@@ -41,9 +41,12 @@ timeout; cancellation and timeout terminate the wrapper and its descendants.
 The SVG must use a 1024×1024 viewBox, an opaque full-canvas background and one
 to four ordered foreground groups. Scripts, foreign objects, text/fonts,
 embedded raster images, masks, filters and external references are rejected.
-Only after parsing and raster validation succeed are `icon.svg` and its v3
-manifest atomically installed. A failed manual conversion leaves the previous
-valid directory untouched.
+Each group is rasterized into the full canvas, so a path that barely spills
+outside the canvas is clipped automatically instead of making the icon fail or
+leak past the frame. A group that is entirely outside the canvas still fails
+validation. Only after parsing and raster validation succeed are `icon.svg` and
+its v3 manifest atomically installed. A failed manual conversion leaves the
+previous valid directory untouched.
 
 ## Local material stage
 

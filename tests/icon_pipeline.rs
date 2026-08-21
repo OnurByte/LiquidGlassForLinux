@@ -168,6 +168,17 @@ fn validates_and_rasterizes_canonical_layers() {
 }
 
 #[test]
+fn clips_foreground_geometry_that_spills_past_the_canvas() {
+    let svg = canonical_svg().replace(
+        "<circle cx=\"512\" cy=\"512\" r=\"260\" fill=\"#ffffff\"/>",
+        "<rect x=\"-160\" y=\"-160\" width=\"1344\" height=\"1344\" fill=\"#ffffff\"/>",
+    );
+    let layers = rasterize_layers(&svg).unwrap();
+    assert_eq!(layers[1].image.dimensions(), (1024, 1024));
+    assert!(layers[1].image.get_pixel(0, 0)[3] > 0);
+}
+
+#[test]
 fn accepts_four_foreground_groups_for_depth_rendering() {
     let layers = validate_svg(&four_group_svg()).unwrap();
     assert_eq!(layers.len(), 5);
@@ -373,14 +384,39 @@ async fn local_renderer_application_writes_real_linux_icon_sizes() {
             },
         )
         .unwrap();
+    let desktop_path = data_home.join("applications/demo.desktop");
+    let desktop = fs::read_to_string(&desktop_path).unwrap();
+    let first_icon = desktop
+        .lines()
+        .find_map(|line| line.strip_prefix("Icon="))
+        .unwrap()
+        .to_owned();
+    assert!(first_icon.starts_with("liquid-glass-demo-"));
     for size in [128, 256, 512] {
         let path = data_home
             .join("icons/hicolor")
-            .join(format!("{size}x{size}/apps/liquid-glass-demo.png"));
+            .join(format!("{size}x{size}/apps/{first_icon}.png"));
         assert_eq!(image::open(path).unwrap().dimensions(), (size, size));
     }
-    let desktop = fs::read_to_string(data_home.join("applications/demo.desktop")).unwrap();
-    assert!(desktop.contains("Icon=liquid-glass-demo"));
+
+    installer
+        .apply_svg(
+            &application,
+            &canonical_svg(),
+            &mut renderer,
+            liquid_glass_icon::renderer::RenderSettings {
+                appearance: Appearance::TintedLight,
+                accent: [255, 88, 120],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let desktop = fs::read_to_string(desktop_path).unwrap();
+    let second_icon = desktop
+        .lines()
+        .find_map(|line| line.strip_prefix("Icon="))
+        .unwrap();
+    assert_ne!(first_icon, second_icon);
 }
 
 #[tokio::test]

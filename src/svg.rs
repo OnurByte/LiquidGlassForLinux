@@ -2,7 +2,7 @@ use crate::{
     error::IconError,
     model::{CANVAS_SIZE, LayerArtifact},
 };
-use image::{RgbaImage, imageops};
+use image::RgbaImage;
 use roxmltree::Document;
 
 #[derive(Debug, Clone)]
@@ -122,17 +122,7 @@ fn render_node_to_canvas(tree: &resvg::usvg::Tree, id: &str) -> Result<RgbaImage
     let node = tree
         .node_by_id(id)
         .ok_or_else(|| invalid(format!("missing renderable layer {id}")))?;
-    let bbox = node
-        .abs_layer_bounding_box()
-        .ok_or_else(|| invalid(format!("empty layer {id}")))?;
-    let x = bbox.x().floor().max(0.0) as u32;
-    let y = bbox.y().floor().max(0.0) as u32;
-    let width = bbox.width().ceil() as u32;
-    let height = bbox.height().ceil() as u32;
-    if x.saturating_add(width) > CANVAS_SIZE || y.saturating_add(height) > CANVAS_SIZE {
-        return Err(invalid(format!("layer {id} extends outside the canvas")));
-    }
-    let mut pixmap = resvg::tiny_skia::Pixmap::new(width, height)
+    let mut pixmap = resvg::tiny_skia::Pixmap::new(CANVAS_SIZE, CANVAS_SIZE)
         .ok_or_else(|| invalid("could not allocate layer canvas"))?;
     resvg::render_node(
         node,
@@ -140,11 +130,12 @@ fn render_node_to_canvas(tree: &resvg::usvg::Tree, id: &str) -> Result<RgbaImage
         &mut pixmap.as_mut(),
     )
     .ok_or_else(|| invalid(format!("empty layer {id}")))?;
-    let layer = RgbaImage::from_raw(width, height, pixmap.take())
+    let layer = RgbaImage::from_raw(CANVAS_SIZE, CANVAS_SIZE, pixmap.take())
         .ok_or_else(|| invalid("invalid rasterized layer"))?;
-    let mut canvas = RgbaImage::new(CANVAS_SIZE, CANVAS_SIZE);
-    imageops::overlay(&mut canvas, &layer, i64::from(x), i64::from(y));
-    Ok(canvas)
+    if layer.pixels().all(|pixel| pixel[3] == 0) {
+        return Err(invalid(format!("layer {id} is empty inside the canvas")));
+    }
+    Ok(layer)
 }
 
 fn invalid(message: impl Into<String>) -> IconError {
