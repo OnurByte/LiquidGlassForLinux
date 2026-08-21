@@ -1,0 +1,854 @@
+use adw::gtk::{self, gdk, glib};
+use adw::prelude::*;
+use adw::{Application, ApplicationWindow, HeaderBar, ToolbarView};
+use libadwaita as adw;
+use liquid_glass_icon::{
+    AppCategory, Appearance,
+    desktop::{
+        DesktopApplication, DesktopTaskEvent, DesktopTaskState, application_output_name,
+        discover_desktop_applications,
+    },
+    icon_install::IconInstaller,
+    openai::{CodexExecProvider, DEFAULT_MODEL, OpenAiResponsesClient, SvgProvider},
+    pipeline::{CacheStatus, cache_status, transform_desktop_icons_with_options},
+    renderer::{GlassRenderer, RenderSettings, RenderTarget},
+};
+use serde::{Deserialize, Serialize};
+use std::{
+    cell::RefCell,
+    collections::HashSet,
+    fs,
+    path::{Path, PathBuf},
+    rc::Rc,
+    sync::{
+        Arc,
+        atomic::{AtomicBool, Ordering},
+        mpsc::{self, Receiver, TryRecvError},
+    },
+    time::Duration,
+};
+
+const APPLICATION_ID: &str = "io.github.yargc.LiquidGlassIcons";
+const MODEL_OPTIONS: [&str; 4] = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.4"];
+
+fn main() {
+    let application = Application::builder()
+        .application_id(APPLICATION_ID)
+        .build();
+    application.connect_activate(|application| {
+        let runtime = match tokio::runtime::Runtime::new() {
+            Ok(runtime) => runtime,
+            Err(error) => {
+                eprintln!("runtime unavailable: {error}");
+                return;
+            }
+        };
+        let renderer = match runtime.block_on(GlassRenderer::new()) {
+            Ok(renderer) => renderer,
+            Err(error) => {
+                eprintln!("Liquid Glass GPU unavailable: {error}");
+                return;
+            }
+        };
+        let state = match IconApp::new(renderer) {
+            Ok(state) => Rc::new(RefCell::new(state)),
+            Err(error) => {
+                eprintln!("Liquid Glass initialization failed: {error}");
+                return;
+            }
+        };
+        build_window(application, state);
+    });
+    application.run();
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+enum ProviderChoice {
+    #[default]
+    Codex,
+    Api,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default, Serialize, Deserialize)]
+enum ThemeChoice {
+    #[default]
+    System,
+    Light,
+    Dark,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct SavedSettings {
+    #[serde(default)]
+    provider: ProviderChoice,
+    #[serde(default = "default_model")]
+    model: String,
+    #[serde(default)]
+    theme: ThemeChoice,
+    #[serde(default = "default_appearance")]
+    appearance: Appearance,
+    #[serde(default = "default_accent")]
+    accent: [u8; 3],
+    #[serde(default)]
+    blocked_categories: HashSet<AppCategory>,
+}
+
+impl Default for SavedSettings {
+    fn default() -> Self {
+        Self {
+            provider: ProviderChoice::Codex,
+            model: DEFAULT_MODEL.to_owned(),
+            theme: ThemeChoice::System,
+            appearance: Appearance::TintedLight,
+            accent: default_accent(),
+            blocked_categories: AppCategory::ALL
+                .into_iter()
+                .filter(|category| !category.enabled_by_default())
+                .collect(),
+        }
+    }
+}
+
+struct IconApp {
+    applications: Vec<DesktopApplication>,
+    tasks: Vec<TaskRow>,
+    provider_choice: ProviderChoice,
+    model: String,
+    theme: ThemeChoice,
+    appearance: Appearance,
+    accent: [u8; 3],
+    api_key: String,
+    blocked_categories: HashSet<AppCategory>,
+    output: PathBuf,
+    status: gtk::Label,
+    count: gtk::Label,
+    list: gtk::ListBox,
+    preview: gtk::Picture,
+    preview_title: gtk::Label,
+    receiver: Option<Receiver<DesktopTaskEvent>>,
+    cancelled: Arc<AtomicBool>,
+    selected: Option<usize>,
+    list_dirty: bool,
+    glass: GlassRenderer,
+    installer: IconInstaller,
+    style_manager: adw::StyleManager,
+}
+
+struct TaskRow {
+    state: DesktopTaskState,
+    message: String,
+}
+
+impl IconApp {
+    fn new(renderer: GlassRenderer) -> Result<Self, String> {
+        let saved = load_settings();
+        let applications = discover_desktop_applications();
+        let output = default_output_dir();
+        let tasks = applications
+            .iter()
+            .map(|application| initial_task(application, &output))
+            .collect();
+        let style_manager = adw::StyleManager::default();
+        style_manager.set_color_scheme(color_scheme(saved.theme));
+        Ok(Self {
+            applications,
+            tasks,
+            provider_choice: saved.provider,
+            model: normalize_model(saved.model),
+            theme: saved.theme,
+            appearance: saved.appearance,
+            accent: saved.accent,
+            api_key: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
+            blocked_categories: saved.blocked_categories,
+            output,
+            status: gtk::Label::new(Some("Ready")),
+            count: gtk::Label::new(None),
+            list: gtk::ListBox::new(),
+            preview: gtk::Picture::new(),
+            preview_title: gtk::Label::new(Some("Preview")),
+            receiver: None,
+            cancelled: Arc::new(AtomicBool::new(false)),
+            selected: None,
+            list_dirty: true,
+            glass: renderer,
+            installer: IconInstaller::default(),
+            style_manager,
+        })
+    }
+
+    fn visible(&self, index: usize) -> bool {
+        !self
+            .blocked_categories
+            .contains(&self.applications[index].category)
+    }
+
+    fn render_settings(&self) -> RenderSettings {
+        RenderSettings {
+            appearance: self.appearance,
+            accent: self.accent,
+            dark_background: self.style_manager.is_dark(),
+            pointer: [0.0, 0.0],
+        }
+    }
+
+    fn rebuild_list(state: &Rc<RefCell<Self>>) {
+        let mut app = state.borrow_mut();
+        app.list_dirty = false;
+        while let Some(child) = app.list.first_child() {
+            app.list.remove(&child);
+        }
+        let mut visible_count = 0;
+        for index in 0..app.applications.len() {
+            if !app.visible(index) {
+                continue;
+            }
+            visible_count += 1;
+            let application = &app.applications[index];
+            let task = &app.tasks[index];
+            let title = glib::markup_escape_text(&application.name);
+            let subtitle = glib::markup_escape_text(&format!(
+                "{} · {}",
+                application.category.label(),
+                task.message
+            ));
+            let row = adw::ActionRow::builder()
+                .title(title.as_str())
+                .subtitle(subtitle.as_str())
+                .activatable(true)
+                .build();
+            if let Some(path) = &application.icon_path {
+                let image = gtk::Image::from_file(path);
+                image.set_pixel_size(32);
+                row.add_prefix(&image);
+            }
+            let state_label = gtk::Label::new(Some(task.state.as_str()));
+            state_label.add_css_class("dim-label");
+            row.add_suffix(&state_label);
+            let retry = gtk::Button::with_label("Reconvert");
+            retry.set_sensitive(app.receiver.is_none());
+            let state_for_retry = Rc::clone(state);
+            retry.connect_clicked(move |_| state_for_retry.borrow_mut().reconvert(index));
+            row.add_suffix(&retry);
+            let restore = gtk::Button::with_label("Restore");
+            restore.set_sensitive(app.installer.is_managed(&application.id));
+            let state_for_restore = Rc::clone(state);
+            restore.connect_clicked(move |_| state_for_restore.borrow_mut().restore_icon(index));
+            row.add_suffix(&restore);
+            let state_for_row = Rc::clone(state);
+            row.connect_activated(move |_| state_for_row.borrow_mut().select(index));
+            app.list.append(&row);
+        }
+        app.count
+            .set_text(&format!("{visible_count}/{} apps", app.applications.len()));
+    }
+
+    fn select(&mut self, index: usize) {
+        self.selected = Some(index);
+        self.preview_title.set_text(&self.applications[index].name);
+        if self.tasks[index].state == DesktopTaskState::Converted {
+            let _ = self.apply_icon(index);
+        }
+        self.load_preview(index);
+    }
+
+    fn load_preview(&mut self, index: usize) {
+        let path = app_output(&self.output, &self.applications[index]).join("icon.svg");
+        let result = fs::read_to_string(&path)
+            .map_err(|error| error.to_string())
+            .and_then(|svg| {
+                self.glass
+                    .load_svg(&svg)
+                    .map_err(|error| error.to_string())?;
+                self.glass
+                    .render(520, 520, self.render_settings(), RenderTarget::Preview)
+                    .map_err(|error| error.to_string())
+            });
+        match result {
+            Ok(image) => self.set_preview(image),
+            Err(error) => {
+                self.preview.set_paintable(Option::<&gdk::Paintable>::None);
+                self.status.set_text(&error);
+            }
+        }
+    }
+
+    fn set_preview(&self, image: image::RgbaImage) {
+        let bytes = glib::Bytes::from_owned(image.into_raw());
+        let texture =
+            gdk::MemoryTexture::new(520, 520, gdk::MemoryFormat::R8g8b8a8, &bytes, 520 * 4);
+        self.preview.set_paintable(Some(&texture));
+    }
+
+    fn provider(&self) -> Result<SvgProvider, String> {
+        let provider = match self.provider_choice {
+            ProviderChoice::Codex => {
+                SvgProvider::Codex(CodexExecProvider::default().with_model(self.model.clone()))
+            }
+            ProviderChoice::Api => SvgProvider::Responses(
+                OpenAiResponsesClient::from_api_key(self.api_key.trim().to_owned())
+                    .map_err(|error| error.to_string())?
+                    .with_model(self.model.clone()),
+            ),
+        };
+        provider.preflight().map_err(|error| error.to_string())?;
+        Ok(provider)
+    }
+
+    fn start_missing(&mut self) {
+        let applications = self
+            .applications
+            .iter()
+            .enumerate()
+            .filter(|(index, _)| self.visible(*index))
+            .map(|(_, application)| application.clone())
+            .collect::<Vec<_>>();
+        self.start_batch(applications, HashSet::new());
+    }
+
+    fn reconvert(&mut self, index: usize) {
+        if self.receiver.is_some() || !self.visible(index) {
+            return;
+        }
+        let application = self.applications[index].clone();
+        self.start_batch(vec![application.clone()], HashSet::from([application.id]));
+    }
+
+    fn restore_icon(&mut self, index: usize) {
+        match self.installer.restore(&self.applications[index].id) {
+            Ok(()) => {
+                self.tasks[index].message = "original launcher restored".to_owned();
+                self.status.set_text("Original launcher restored");
+                self.list_dirty = true;
+            }
+            Err(error) => self.status.set_text(&format!("Restore blocked: {error}")),
+        }
+    }
+
+    fn start_batch(&mut self, applications: Vec<DesktopApplication>, force_ids: HashSet<String>) {
+        if self.receiver.is_some() || applications.is_empty() {
+            return;
+        }
+        let provider = match self.provider() {
+            Ok(provider) => provider,
+            Err(error) => {
+                self.status.set_text(&error);
+                return;
+            }
+        };
+        let output = self.output.clone();
+        self.cancelled = Arc::new(AtomicBool::new(false));
+        let cancelled = Arc::clone(&self.cancelled);
+        let (sender, receiver) = mpsc::channel();
+        self.receiver = Some(receiver);
+        self.status.set_text(&format!(
+            "Processing {} application icons…",
+            applications.len()
+        ));
+        std::thread::spawn(move || {
+            let Ok(runtime) = tokio::runtime::Runtime::new() else {
+                return;
+            };
+            runtime.block_on(transform_desktop_icons_with_options(
+                &applications,
+                &output,
+                &provider,
+                cancelled,
+                &force_ids,
+                |event| {
+                    let _ = sender.send(event);
+                },
+            ));
+        });
+    }
+
+    fn stop(&mut self) {
+        if self.receiver.is_some() {
+            self.cancelled.store(true, Ordering::Relaxed);
+            self.status.set_text("Stopping current provider request…");
+        }
+    }
+
+    fn receive_events(&mut self) {
+        let Some(receiver) = self.receiver.take() else {
+            return;
+        };
+        let mut disconnected = false;
+        let mut event_count = 0;
+        loop {
+            match receiver.try_recv() {
+                Ok(event) => {
+                    event_count += 1;
+                    if let Some(index) = self
+                        .applications
+                        .iter()
+                        .position(|application| application.id == event.application_id)
+                    {
+                        self.tasks[index].state = event.state;
+                        self.tasks[index].message = event.message.clone();
+                        if matches!(
+                            event.state,
+                            DesktopTaskState::Completed | DesktopTaskState::Converted
+                        ) {
+                            match self.apply_icon(index) {
+                                Ok(()) => {
+                                    self.tasks[index].message =
+                                        if event.state == DesktopTaskState::Completed {
+                                            "generated and applied".to_owned()
+                                        } else {
+                                            "cached and applied".to_owned()
+                                        }
+                                }
+                                Err(error) => {
+                                    self.tasks[index].message =
+                                        format!("icon ready; apply failed: {error}")
+                                }
+                            }
+                        }
+                    }
+                    self.status
+                        .set_text(&format!("{}: {}", event.application_name, event.message));
+                }
+                Err(TryRecvError::Empty) => break,
+                Err(TryRecvError::Disconnected) => {
+                    disconnected = true;
+                    break;
+                }
+            }
+        }
+        if !disconnected {
+            self.receiver = Some(receiver);
+        }
+        if disconnected {
+            self.status
+                .set_text(if self.cancelled.load(Ordering::Relaxed) {
+                    "Stopped"
+                } else {
+                    "Conversion queue finished"
+                });
+        }
+        if event_count > 0 {
+            self.list_dirty = true;
+        }
+    }
+
+    fn apply_icon(&mut self, index: usize) -> Result<(), String> {
+        let svg = fs::read_to_string(
+            app_output(&self.output, &self.applications[index]).join("icon.svg"),
+        )
+        .map_err(|error| error.to_string())?;
+        let settings = self.render_settings();
+        self.installer
+            .apply_svg(&self.applications[index], &svg, &mut self.glass, settings)
+            .map_err(|error| error.to_string())?;
+        if self.selected == Some(index) {
+            self.load_preview(index);
+        }
+        Ok(())
+    }
+
+    fn save(&self) {
+        let settings = SavedSettings {
+            provider: self.provider_choice,
+            model: self.model.clone(),
+            theme: self.theme,
+            appearance: self.appearance,
+            accent: self.accent,
+            blocked_categories: self.blocked_categories.clone(),
+        };
+        let path = config_path();
+        if let Some(parent) = path.parent() {
+            let _ = fs::create_dir_all(parent);
+        }
+        if let Ok(bytes) = serde_json::to_vec_pretty(&settings) {
+            let _ = fs::write(path, bytes);
+        }
+    }
+
+    fn set_theme(&mut self, theme: ThemeChoice) {
+        self.theme = theme;
+        self.style_manager.set_color_scheme(color_scheme(theme));
+        if matches!(
+            self.appearance,
+            Appearance::TintedLight | Appearance::TintedDark
+        ) {
+            self.appearance = tinted_for(self.style_manager.is_dark());
+        }
+        self.save();
+        self.reapply_cached();
+    }
+
+    fn reapply_cached(&mut self) {
+        let indexes = self
+            .tasks
+            .iter()
+            .enumerate()
+            .filter_map(|(index, task)| {
+                matches!(
+                    task.state,
+                    DesktopTaskState::Converted | DesktopTaskState::Completed
+                )
+                .then_some(index)
+            })
+            .collect::<Vec<_>>();
+        for index in indexes {
+            let _ = self.apply_icon(index);
+        }
+    }
+}
+
+fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
+    let (list, preview, preview_title, status) = {
+        let app = state.borrow();
+        (
+            app.list.clone(),
+            app.preview.clone(),
+            app.preview_title.clone(),
+            app.status.clone(),
+        )
+    };
+    list.set_selection_mode(gtk::SelectionMode::None);
+    list.add_css_class("boxed-list");
+    preview.set_content_fit(gtk::ContentFit::Contain);
+    preview.set_hexpand(true);
+    preview.set_vexpand(true);
+    preview.set_size_request(520, 520);
+    preview_title.add_css_class("title-2");
+    status.set_ellipsize(gtk::pango::EllipsizeMode::End);
+
+    let provider = gtk::DropDown::from_strings(&["Codex exec", "API key"]);
+    let model = gtk::DropDown::from_strings(&MODEL_OPTIONS);
+    let api_key = gtk::PasswordEntry::new();
+    api_key.set_placeholder_text(Some("OpenAI API key"));
+    api_key.set_hexpand(false);
+    let generate = gtk::Button::with_label("Generate missing");
+    generate.add_css_class("suggested-action");
+    let stop = gtk::Button::with_label("Stop");
+    stop.add_css_class("destructive-action");
+    stop.set_sensitive(false);
+
+    let theme = gtk::DropDown::from_strings(&["System", "Light", "Dark"]);
+    let appearance = gtk::DropDown::from_strings(&[
+        "Default",
+        "Dark",
+        "Clear Light",
+        "Clear Dark",
+        "Tinted Light",
+        "Tinted Dark",
+    ]);
+    let color_dialog = gtk::ColorDialog::new();
+    color_dialog.set_with_alpha(false);
+    let color = gtk::ColorDialogButton::new(Some(color_dialog));
+    color.set_tooltip_text(Some(
+        "Apple Tinted accent — only local renderer, never sent to AI",
+    ));
+
+    {
+        let app = state.borrow();
+        provider.set_selected(if app.provider_choice == ProviderChoice::Api {
+            1
+        } else {
+            0
+        });
+        model.set_selected(model_index(&app.model));
+        theme.set_selected(theme_index(app.theme));
+        appearance.set_selected(appearance_index(app.appearance));
+        color.set_rgba(&gdk::RGBA::new(
+            app.accent[0] as f32 / 255.0,
+            app.accent[1] as f32 / 255.0,
+            app.accent[2] as f32 / 255.0,
+            1.0,
+        ));
+        api_key.set_visible(app.provider_choice == ProviderChoice::Api);
+    }
+
+    let category_popover = gtk::Popover::new();
+    let category_box = gtk::Box::new(gtk::Orientation::Vertical, 6);
+    category_box.set_margin_top(12);
+    category_box.set_margin_bottom(12);
+    category_box.set_margin_start(12);
+    category_box.set_margin_end(12);
+    for category in AppCategory::ALL {
+        let check = gtk::CheckButton::with_label(category.label());
+        check.set_active(!state.borrow().blocked_categories.contains(&category));
+        let state_for_category = Rc::clone(&state);
+        check.connect_toggled(move |check| {
+            let mut app = state_for_category.borrow_mut();
+            if check.is_active() {
+                app.blocked_categories.remove(&category);
+            } else {
+                app.blocked_categories.insert(category);
+            }
+            app.list_dirty = true;
+            app.save();
+            drop(app);
+            IconApp::rebuild_list(&state_for_category);
+        });
+        category_box.append(&check);
+    }
+    category_popover.set_child(Some(&category_box));
+    let categories = gtk::MenuButton::new();
+    categories.set_label("Categories");
+    categories.set_popover(Some(&category_popover));
+
+    let controls = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    controls.set_margin_top(6);
+    controls.set_margin_bottom(6);
+    controls.set_margin_start(12);
+    controls.set_margin_end(12);
+    controls.append(&provider);
+    controls.append(&api_key);
+    controls.append(&model);
+    controls.append(&generate);
+    controls.append(&stop);
+    controls.append(&categories);
+
+    let settings = gtk::Box::new(gtk::Orientation::Horizontal, 6);
+    settings.set_margin_top(6);
+    settings.set_margin_bottom(6);
+    settings.set_margin_start(12);
+    settings.set_margin_end(12);
+    settings.append(&gtk::Label::new(Some("Theme")));
+    settings.append(&theme);
+    settings.append(&gtk::Label::new(Some("Material")));
+    settings.append(&appearance);
+    settings.append(&gtk::Label::new(Some("Global accent")));
+    settings.append(&color);
+
+    let list_scroll = gtk::ScrolledWindow::builder()
+        .vexpand(true)
+        .min_content_width(390)
+        .child(&list)
+        .build();
+    let right = gtk::Box::new(gtk::Orientation::Vertical, 12);
+    right.set_margin_top(18);
+    right.set_margin_bottom(18);
+    right.set_margin_start(18);
+    right.set_margin_end(18);
+    right.append(&preview_title);
+    right.append(&preview);
+    let content = gtk::Box::new(gtk::Orientation::Horizontal, 0);
+    content.append(&list_scroll);
+    content.append(&right);
+
+    let top = gtk::Box::new(gtk::Orientation::Vertical, 0);
+    top.append(&controls);
+    top.append(&settings);
+    top.append(&content);
+    let toolbar = ToolbarView::new();
+    toolbar.add_top_bar(&HeaderBar::new());
+    toolbar.set_content(Some(&top));
+    let window = ApplicationWindow::builder()
+        .application(application)
+        .title("Liquid Glass Icons")
+        .default_width(1240)
+        .default_height(820)
+        .content(&toolbar)
+        .build();
+
+    {
+        let state_for_generate = Rc::clone(&state);
+        generate.connect_clicked(move |_| state_for_generate.borrow_mut().start_missing());
+        let state_for_stop = Rc::clone(&state);
+        stop.connect_clicked(move |_| state_for_stop.borrow_mut().stop());
+        let state_for_provider = Rc::clone(&state);
+        let api_key_for_visibility = api_key.clone();
+        provider.connect_selected_notify(move |dropdown| {
+            let mut app = state_for_provider.borrow_mut();
+            app.provider_choice = if dropdown.selected() == 1 {
+                ProviderChoice::Api
+            } else {
+                ProviderChoice::Codex
+            };
+            api_key_for_visibility.set_visible(app.provider_choice == ProviderChoice::Api);
+            app.save();
+        });
+        let state_for_api_key = Rc::clone(&state);
+        api_key.connect_changed(move |entry| {
+            state_for_api_key.borrow_mut().api_key = entry.text().to_string();
+        });
+        let state_for_model = Rc::clone(&state);
+        model.connect_selected_notify(move |dropdown| {
+            let mut app = state_for_model.borrow_mut();
+            app.model = MODEL_OPTIONS
+                .get(dropdown.selected() as usize)
+                .unwrap_or(&DEFAULT_MODEL)
+                .to_string();
+            app.save();
+        });
+        let state_for_theme = Rc::clone(&state);
+        theme.connect_selected_notify(move |dropdown| {
+            state_for_theme
+                .borrow_mut()
+                .set_theme(theme_from_index(dropdown.selected()))
+        });
+        let state_for_appearance = Rc::clone(&state);
+        appearance.connect_selected_notify(move |dropdown| {
+            let mut app = state_for_appearance.borrow_mut();
+            app.appearance = Appearance::ALL
+                .get(dropdown.selected() as usize)
+                .copied()
+                .unwrap_or(Appearance::TintedLight);
+            app.save();
+            app.reapply_cached();
+        });
+        let state_for_color = Rc::clone(&state);
+        color.connect_rgba_notify(move |button| {
+            let rgba = button.rgba();
+            let mut app = state_for_color.borrow_mut();
+            app.accent = [
+                (rgba.red() * 255.0) as u8,
+                (rgba.green() * 255.0) as u8,
+                (rgba.blue() * 255.0) as u8,
+            ];
+            app.appearance = tinted_for(app.style_manager.is_dark());
+            app.save();
+            app.reapply_cached();
+        });
+    }
+
+    let state_for_tick = Rc::clone(&state);
+    glib::timeout_add_local(Duration::from_millis(100), move || {
+        let (running, list_dirty) = {
+            let mut app = state_for_tick.borrow_mut();
+            let running = app.receiver.is_some();
+            app.receive_events();
+            (running, app.list_dirty)
+        };
+        generate.set_sensitive(!running);
+        stop.set_sensitive(running);
+        if list_dirty {
+            IconApp::rebuild_list(&state_for_tick);
+        }
+        glib::ControlFlow::Continue
+    });
+    IconApp::rebuild_list(&state);
+    if let Some(index) = {
+        let app = state.borrow();
+        app.applications.iter().enumerate().find_map(|(index, _)| {
+            (app.visible(index) && app.tasks[index].state == DesktopTaskState::Converted)
+                .then_some(index)
+        })
+    } {
+        state.borrow_mut().select(index);
+    }
+    window.connect_close_request(move |_| {
+        state.borrow().save();
+        glib::Propagation::Proceed
+    });
+    window.present();
+}
+
+fn initial_task(application: &DesktopApplication, output: &Path) -> TaskRow {
+    let Some(_) = application.icon_path else {
+        return TaskRow {
+            state: DesktopTaskState::Skipped,
+            message: "icon not found".to_owned(),
+        };
+    };
+    let Ok(input) = application.input() else {
+        return TaskRow {
+            state: DesktopTaskState::Failed,
+            message: "icon unreadable".to_owned(),
+        };
+    };
+    match cache_status(&app_output(output, application), &input.bytes) {
+        CacheStatus::Missing => TaskRow {
+            state: DesktopTaskState::Queued,
+            message: "needs conversion".to_owned(),
+        },
+        CacheStatus::Current => TaskRow {
+            state: DesktopTaskState::Converted,
+            message: "already converted".to_owned(),
+        },
+        CacheStatus::Stale => TaskRow {
+            state: DesktopTaskState::Stale,
+            message: "source changed; reconvert manually".to_owned(),
+        },
+    }
+}
+
+fn app_output(output: &Path, application: &DesktopApplication) -> PathBuf {
+    output
+        .join("apps")
+        .join(application_output_name(&application.id))
+}
+
+fn default_output_dir() -> PathBuf {
+    let data_home = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
+        .unwrap_or_else(|| PathBuf::from("."));
+    data_home.join("liquid-glass-icon/out")
+}
+
+fn config_path() -> PathBuf {
+    std::env::var_os("XDG_CONFIG_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".config")))
+        .unwrap_or_else(|| PathBuf::from("."))
+        .join("liquid-glass-icon/settings.json")
+}
+
+fn load_settings() -> SavedSettings {
+    fs::read(config_path())
+        .ok()
+        .and_then(|bytes| serde_json::from_slice(&bytes).ok())
+        .unwrap_or_default()
+}
+fn default_model() -> String {
+    DEFAULT_MODEL.to_owned()
+}
+fn default_appearance() -> Appearance {
+    Appearance::TintedLight
+}
+fn default_accent() -> [u8; 3] {
+    [137, 180, 250]
+}
+fn normalize_model(model: String) -> String {
+    let model = model.trim();
+    if model.is_empty() {
+        DEFAULT_MODEL.to_owned()
+    } else {
+        model.to_owned()
+    }
+}
+fn color_scheme(theme: ThemeChoice) -> adw::ColorScheme {
+    match theme {
+        ThemeChoice::System => adw::ColorScheme::Default,
+        ThemeChoice::Light => adw::ColorScheme::ForceLight,
+        ThemeChoice::Dark => adw::ColorScheme::ForceDark,
+    }
+}
+fn tinted_for(dark: bool) -> Appearance {
+    if dark {
+        Appearance::TintedDark
+    } else {
+        Appearance::TintedLight
+    }
+}
+fn theme_index(theme: ThemeChoice) -> u32 {
+    match theme {
+        ThemeChoice::System => 0,
+        ThemeChoice::Light => 1,
+        ThemeChoice::Dark => 2,
+    }
+}
+fn theme_from_index(index: u32) -> ThemeChoice {
+    match index {
+        1 => ThemeChoice::Light,
+        2 => ThemeChoice::Dark,
+        _ => ThemeChoice::System,
+    }
+}
+fn appearance_index(appearance: Appearance) -> u32 {
+    Appearance::ALL
+        .iter()
+        .position(|candidate| *candidate == appearance)
+        .unwrap_or(4) as u32
+}
+fn model_index(model: &str) -> u32 {
+    MODEL_OPTIONS
+        .iter()
+        .position(|candidate| *candidate == model)
+        .unwrap_or(0) as u32
+}

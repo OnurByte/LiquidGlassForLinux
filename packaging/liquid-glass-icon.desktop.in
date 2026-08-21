@@ -1,0 +1,12 @@
+[Desktop Entry]
+Version=1.0
+Type=Application
+Name=Liquid Glass Icons
+Comment=Convert application icons into local Liquid Glass SVGs
+Exec=@EXEC@
+TryExec=@EXEC@
+Icon=io.github.yargc.LiquidGlassIcons
+Terminal=false
+Categories=Graphics;
+StartupNotify=true
+StartupWMClass=io.github.yargc.LiquidGlassIcons

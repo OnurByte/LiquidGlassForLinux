@@ -1,0 +1,22 @@
+{
+  "version": 2,
+  "canvas": {
+    "width": 1024,
+    "height": 1024,
+    "colorSpace": "sRGB",
+    "alpha": true
+  },
+  "layers": {
+    "minimum": ["background", "foreground-1"],
+    "maximumForegroundLayers": 3
+  },
+  "generator": {
+    "providers": ["codex-exec", "responses-api"],
+    "promptVersion": 3,
+    "requestsPerConversionAttempt": 1
+  },
+  "renderer": {
+    "appearances": ["default", "dark", "clear-light", "clear-dark", "tinted-light", "tinted-dark"],
+    "accent": "runtime-only"
+  }
+}

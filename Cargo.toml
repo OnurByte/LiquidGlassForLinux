@@ -1,0 +1,32 @@
+[package]
+name = "liquid-glass-icon"
+version = "0.1.0"
+edition = "2024"
+description = "Turn application icons into layered Apple-like Liquid Glass variants."
+license = "MIT"
+default-run = "liquid-glass-icon"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive"] }
+image = { version = "0.25", default-features = false, features = ["jpeg", "png", "webp"] }
+libadwaita = { version = "0.9.2", features = ["v1_4", "gtk_v4_10"] }
+libc = "0.2"
+reqwest = { version = "0.12", default-features = false, features = ["json", "rustls-tls"] }
+resvg = "0.45"
+roxmltree = "0.20"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+sha2 = "0.10"
+tempfile = "3"
+thiserror = "2"
+tokio = { version = "1", features = ["macros", "rt-multi-thread", "time"] }
+wgpu = "30.0.0"
+
+[dev-dependencies]
+httpmock = "0.7"
+
+[[bin]]
+name = "liquid-glass-icon-gui"
+path = "src/bin/gui.rs"

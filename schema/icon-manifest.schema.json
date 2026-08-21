@@ -1,0 +1,64 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://liquid-glass-icon.dev/schema/icon-manifest.schema.json",
+  "title": "Liquid Glass canonical SVG manifest",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["schema_version", "source", "canvas", "svg", "layers", "generator"],
+  "properties": {
+    "schema_version": { "const": 3 },
+    "source": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["filename", "sha256"],
+      "properties": {
+        "filename": { "type": "string", "minLength": 1 },
+        "sha256": { "type": "string", "pattern": "^[0-9a-f]{64}$" }
+      }
+    },
+    "canvas": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["width", "height", "color_space", "has_alpha"],
+      "properties": {
+        "width": { "const": 1024 },
+        "height": { "const": 1024 },
+        "color_space": { "const": "sRGB" },
+        "has_alpha": { "const": true }
+      }
+    },
+    "svg": { "const": "icon.svg" },
+    "layers": {
+      "type": "array",
+      "minItems": 2,
+      "maxItems": 5,
+      "prefixItems": [
+        {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "z_index"],
+          "properties": { "id": { "const": "background" }, "z_index": { "const": 0 } }
+        }
+      ],
+      "items": {
+        "type": "object",
+        "additionalProperties": false,
+        "required": ["id", "z_index"],
+        "properties": {
+          "id": { "pattern": "^foreground-[1-4]$" },
+          "z_index": { "type": "integer", "minimum": 1, "maximum": 4 }
+        }
+      }
+    },
+    "generator": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["provider", "prompt_version"],
+      "properties": {
+        "provider": { "enum": ["codex-exec", "responses-api"] },
+        "model": { "type": "string", "minLength": 1 },
+        "prompt_version": { "type": "integer", "minimum": 3 }
+      }
+    }
+  }
+}
