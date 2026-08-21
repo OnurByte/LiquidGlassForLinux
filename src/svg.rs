@@ -124,9 +124,14 @@ fn render_node_to_canvas(tree: &resvg::usvg::Tree, id: &str) -> Result<RgbaImage
         .ok_or_else(|| invalid(format!("missing renderable layer {id}")))?;
     let mut pixmap = resvg::tiny_skia::Pixmap::new(CANVAS_SIZE, CANVAS_SIZE)
         .ok_or_else(|| invalid("could not allocate layer canvas"))?;
+    let bbox = node
+        .abs_layer_bounding_box()
+        .ok_or_else(|| invalid(format!("empty layer {id}")))?;
+    // resvg centers render_node() on the node bbox; cancel that offset so
+    // every texture keeps the coordinates from the original SVG.
     resvg::render_node(
         node,
-        resvg::tiny_skia::Transform::identity(),
+        resvg::tiny_skia::Transform::from_translate(bbox.x(), bbox.y()),
         &mut pixmap.as_mut(),
     )
     .ok_or_else(|| invalid(format!("empty layer {id}")))?;

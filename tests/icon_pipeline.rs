@@ -168,6 +168,17 @@ fn validates_and_rasterizes_canonical_layers() {
 }
 
 #[test]
+fn rasterized_layers_keep_their_svg_coordinates() {
+    let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<g id="background"><rect width="1024" height="1024" fill="#254060"/></g>
+<g id="foreground-1"><rect x="240" y="320" width="180" height="140" fill="#ffffff"/></g>
+</svg>"##;
+    let layer = rasterize_layers(svg).unwrap().remove(1);
+    assert!(layer.image.get_pixel(240, 320)[3] > 8);
+    assert_eq!(layer.image.get_pixel(0, 0)[3], 0);
+}
+
+#[test]
 fn clips_foreground_geometry_that_spills_past_the_canvas() {
     let svg = canonical_svg().replace(
         "<circle cx=\"512\" cy=\"512\" r=\"260\" fill=\"#ffffff\"/>",
