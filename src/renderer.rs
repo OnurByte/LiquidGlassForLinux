@@ -23,6 +23,7 @@ pub struct RenderSettings {
     pub accent: [u8; 3],
     pub dark_background: bool,
     pub pointer: [f32; 2],
+    pub layer: Option<usize>,
 }
 
 impl Default for RenderSettings {
@@ -32,6 +33,7 @@ impl Default for RenderSettings {
             accent: [137, 180, 250],
             dark_background: false,
             pointer: [0.0, 0.0],
+            layer: None,
         }
     }
 }
@@ -85,6 +87,13 @@ impl GlassRenderer {
 
     pub fn has_preview(&self) -> bool {
         self.icon.is_some()
+    }
+
+    pub fn layer_count(&self) -> usize {
+        self.icon
+            .as_ref()
+            .map(|icon| icon.layer_count as usize)
+            .unwrap_or_default()
     }
 
     pub fn render(
@@ -418,7 +427,7 @@ impl RenderSettings {
             },
             self.pointer[0],
             self.pointer[1],
-            0.0,
+            self.layer.map(|layer| layer as f32).unwrap_or(-1.0),
             0.0,
         ]
     }
@@ -550,13 +559,21 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let source_background = textureSample(layers, layer_sampler, uv, 0);
     var color = source_background.rgb;
     var alpha = source_background.a;
+    let environment = preview_background(uv + params.pointer.xy * 0.008);
+    if params.pointer.z >= 0.0 {
+        let selected_index = i32(params.pointer.z + 0.5);
+        let selected = textureSample(layers, layer_sampler, uv, selected_index);
+        let selected_alpha = selected.a * mask;
+        return vec4(mix(environment, selected.rgb, selected_alpha), 1.0);
+    }
+
     let foreground_count = max(params.state.y - 1.0, 1.0);
 
     for (var index: i32 = 1; index < 5; index = index + 1) {
         if f32(index) >= params.state.y { break; }
         let z = f32(index) / foreground_count;
         let parallax = params.pointer.xy * z * 0.036;
-        let depth_gap = vec2<f32>(0.0025, -0.0018) * z;
+        let depth_gap = vec2<f32>(0.0, -0.008) * z;
         let sample_uv = uv + parallax + depth_gap;
         let source = textureSample(layers, layer_sampler, sample_uv, index);
         let shadow = textureSample(
@@ -573,8 +590,9 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         let specular = vec3<f32>(0.78, 0.86, 1.0) * edge * (0.16 + z * 0.16);
         let refracted = mix(source.rgb, color, 0.08 + z * 0.10);
         let material = refracted + specular;
-        color = color * (1.0 - source.a) + material * source.a;
-        alpha = alpha + source.a * (1.0 - alpha);
+        let layer_alpha = source.a * (0.72 + z * 0.24);
+        color = color * (1.0 - layer_alpha) + material * layer_alpha;
+        alpha = alpha + layer_alpha * (1.0 - alpha);
     }
 
     let luminance = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
@@ -601,7 +619,6 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         0.98,
         pow(abs((uv.x - 0.5) / 0.41), 4.2) + pow(abs((uv.y - 0.5) / 0.41), 4.2),
     );
-    let environment = preview_background(uv + params.pointer.xy * 0.008);
     let refracted = select(color, environment, params.state.w < 0.5);
     var glass = mix(artwork, refracted, glass_mix);
     let highlight = pow(max(0.0, 1.0 - distance(uv, vec2<f32>(0.34, 0.28)) * 1.8), 4.0) * 0.28;
@@ -675,7 +692,7 @@ mod tests {
             .load_svg(
                 r##"<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
 <g id="background"><rect width="1024" height="1024" fill="#203050"/></g>
-<g id="foreground-1"><circle cx="512" cy="512" r="240" fill="#ffffff"/></g>
+<g id="foreground-1"><circle cx="512" cy="512" r="240" fill="#ff2030"/></g>
 </svg>"##,
             )
             .unwrap();
@@ -687,5 +704,19 @@ mod tests {
         assert_eq!(image.get_pixel(127, 0)[3], 0);
         assert_eq!(image.get_pixel(0, 127)[3], 0);
         assert_eq!(image.get_pixel(127, 127)[3], 0);
+
+        let selected = renderer
+            .render(
+                128,
+                128,
+                RenderSettings {
+                    layer: Some(1),
+                    ..RenderSettings::default()
+                },
+                RenderTarget::Preview,
+            )
+            .unwrap();
+        assert!(selected.get_pixel(64, 64)[0] > 200);
+        assert!(selected.get_pixel(64, 64)[1] < 100);
     }
 }

@@ -15,7 +15,7 @@ use liquid_glass_icon::{
 };
 use serde::{Deserialize, Serialize};
 use std::{
-    cell::RefCell,
+    cell::{Cell, RefCell},
     collections::HashSet,
     fs,
     path::{Path, PathBuf},
@@ -126,6 +126,9 @@ struct IconApp {
     list: gtk::ListBox,
     preview: gtk::Picture,
     preview_title: gtk::Label,
+    preview_selector: gtk::DropDown,
+    preview_layer: Option<usize>,
+    preview_selector_updating: Rc<Cell<bool>>,
     receiver: Option<Receiver<DesktopTaskEvent>>,
     cancelled: Arc<AtomicBool>,
     selected: Option<usize>,
@@ -167,6 +170,9 @@ impl IconApp {
             list: gtk::ListBox::new(),
             preview: gtk::Picture::new(),
             preview_title: gtk::Label::new(Some("Preview")),
+            preview_selector: gtk::DropDown::from_strings(&["Composite"]),
+            preview_layer: None,
+            preview_selector_updating: Rc::new(Cell::new(false)),
             receiver: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             selected: None,
@@ -189,6 +195,7 @@ impl IconApp {
             accent: self.accent,
             dark_background: self.style_manager.is_dark(),
             pointer: [0.0, 0.0],
+            layer: None,
         }
     }
 
@@ -261,8 +268,9 @@ impl IconApp {
                 self.glass
                     .load_svg(&svg)
                     .map_err(|error| error.to_string())?;
+                self.set_preview_layers(self.glass.layer_count());
                 self.glass
-                    .render(520, 520, self.render_settings(), RenderTarget::Preview)
+                    .render(520, 520, self.preview_settings(), RenderTarget::Preview)
                     .map_err(|error| error.to_string())
             });
         match result {
@@ -279,6 +287,42 @@ impl IconApp {
         let texture =
             gdk::MemoryTexture::new(520, 520, gdk::MemoryFormat::R8g8b8a8, &bytes, 520 * 4);
         self.preview.set_paintable(Some(&texture));
+    }
+
+    fn set_preview_layers(&mut self, layer_count: usize) {
+        let mut labels = vec!["Composite".to_owned()];
+        for layer in 0..layer_count {
+            labels.push(if layer == 0 {
+                "Background".to_owned()
+            } else {
+                format!("Layer {layer}")
+            });
+        }
+        let label_refs = labels.iter().map(String::as_str).collect::<Vec<_>>();
+        let selected = self
+            .preview_layer
+            .filter(|layer| *layer < layer_count)
+            .map(|layer| layer + 1)
+            .unwrap_or(0);
+        self.preview_layer = (selected > 0).then_some(selected - 1);
+        self.preview_selector_updating.set(true);
+        self.preview_selector
+            .set_model(Some(&gtk::StringList::new(&label_refs)));
+        self.preview_selector.set_selected(selected as u32);
+        self.preview_selector_updating.set(false);
+    }
+
+    fn set_preview_layer(&mut self, selected: u32) {
+        self.preview_layer = (selected > 0).then_some(selected as usize - 1);
+        if let Some(index) = self.selected {
+            self.load_preview(index);
+        }
+    }
+
+    fn preview_settings(&self) -> RenderSettings {
+        let mut settings = self.render_settings();
+        settings.layer = self.preview_layer;
+        settings
     }
 
     fn provider(&self) -> Result<SvgProvider, String> {
@@ -737,6 +781,12 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     let preview_heading = gtk::Box::new(gtk::Orientation::Vertical, 3);
     preview_heading.append(&preview_title);
     preview_heading.append(&preview_caption);
+    let preview_controls = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    preview_controls.append(&field_label("Inspect"));
+    let preview_selector = state.borrow().preview_selector.clone();
+    preview_selector.set_hexpand(true);
+    preview_controls.append(&preview_selector);
+    preview_heading.append(&preview_controls);
     let preview_surface = gtk::Box::new(gtk::Orientation::Vertical, 0);
     preview_surface.add_css_class("preview-surface");
     preview_surface.set_vexpand(true);
@@ -827,6 +877,16 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
                 .unwrap_or(&DEFAULT_MODEL)
                 .to_string();
             app.save();
+        });
+        let state_for_preview = Rc::clone(&state);
+        let preview_selector_updating = state.borrow().preview_selector_updating.clone();
+        preview_selector.connect_selected_notify(move |dropdown| {
+            if preview_selector_updating.get() {
+                return;
+            }
+            state_for_preview
+                .borrow_mut()
+                .set_preview_layer(dropdown.selected());
         });
         let state_for_theme = Rc::clone(&state);
         theme.connect_selected_notify(move |dropdown| {
