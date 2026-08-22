@@ -33,6 +33,15 @@ treated as a cutout, so it follows a background override. `pointer` and `tilt`
 are preview-only: `RenderTarget::Icon` forces them to rest so installed assets
 are deterministic.
 
+## Optional shell motion
+
+`extensions/liquid-glass-parallax@onurbyte` is a GNOME Shell 50 extension
+with UUID `liquid-glass-parallax@onurbyte.github.io`,
+separate from icon rendering. It reads the user-managed state file and applies
+small pointer translations only to matching Shell application actors. It does
+not alter exported PNGs or target every shell actor. The source installer is
+`scripts/install-gnome-parallax.sh`; KDE Plasma and Hyprland remain static.
+
 ## Other languages
 
 Invoke the CLI and consume `icon.svg` plus `icon-manifest.json`. There is no

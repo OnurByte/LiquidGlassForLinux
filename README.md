@@ -53,6 +53,8 @@ Clear, Tinted or preview motion never sends another AI request.
   cache refresh and a fingerprinted `.desktop` override. The GNOME app grid
   sees an override reinsertion without logout; `/usr/share/applications` is
   not modified.
+- Optional GNOME Shell 50 pointer parallax for managed app icons only. It
+  follows the local managed-icon state instead of moving every shell icon.
 - Explicit Stop, a 120-second Codex timeout and no AI work at application
   startup.
 
@@ -209,6 +211,24 @@ cargo run --release -- archive --json
 # Restore a managed launcher and original icon.
 cargo run --release -- restore --desktop-id org.gnome.Calculator.desktop --json
 ```
+
+## Optional GNOME Shell parallax
+
+The exported PNGs are intentionally static. On GNOME Shell 50, the optional
+extension adds cursor parallax only while an icon is visible in the Dash or app
+grid, and only for applications listed in
+`$XDG_DATA_HOME/liquid-glass-icon/managed-icons.json`. It watches that file, so
+newly managed icons join without another extension install. It does not theme
+the panel, dock or unrelated applications.
+
+```bash
+./scripts/install-gnome-parallax.sh
+```
+
+KDE Plasma and Hyprland are detected by the installer and deliberately keep
+the installed icons static. GNOME Shell runs extension code in the Shell
+process; on Wayland, log out and back in once after installing or changing the
+extension source.
 
 Generated data looks like this:
 

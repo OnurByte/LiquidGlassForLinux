@@ -1,0 +1,7 @@
+{
+  "uuid": "liquid-glass-parallax@onurbyte.github.io",
+  "name": "Liquid Glass Icon Parallax",
+  "description": "Pointer parallax for application icons managed by LiquidGlassForLinux.",
+  "shell-version": ["50"],
+  "url": "https://github.com/OnurByte/LiquidGlassForLinux"
+}
