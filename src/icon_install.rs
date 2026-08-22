@@ -20,6 +20,11 @@ struct ManagedIcon {
     override_path: PathBuf,
     icon_files: Vec<PathBuf>,
     managed_sha256: String,
+    /// Renderer/material/composition revision the PNGs were produced with.
+    /// Missing (older state files) means stale so icons are rebuilt from
+    /// their canonical SVG without another AI request.
+    #[serde(default)]
+    renderer_revision: u32,
     backup_path: Option<PathBuf>,
 }
 
@@ -130,6 +135,7 @@ impl IconInstaller {
                 override_path,
                 icon_files,
                 managed_sha256,
+                renderer_revision: crate::renderer::RENDERER_REVISION,
                 backup_path,
             },
         );

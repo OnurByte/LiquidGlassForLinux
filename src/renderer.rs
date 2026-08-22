@@ -9,7 +9,18 @@ use wgpu::util::DeviceExt;
 
 const GPU_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const MAX_LAYERS: u32 = 5;
-const ICON_ARTWORK_SIZE: u32 = 820;
+
+/// Apple-style safe zone: the optical artwork area covers roughly 84% of the
+/// 1024 px canvas. Artwork smaller than `SAFE_ZONE_KEEP_MIN` is grown toward
+/// the target with one shared transform; overflowing artwork is shrunk the
+/// same way. Artwork already inside the band keeps its source coordinates.
+pub const SAFE_ZONE_FRACTION: f32 = 0.84;
+const SAFE_ZONE_TARGET: f32 = 860.0;
+const SAFE_ZONE_KEEP_MIN: f32 = SAFE_ZONE_TARGET * 0.92;
+
+/// Bumped whenever composition or material behavior changes so cached icons
+/// are rebuilt from their canonical SVGs without another AI request.
+pub const RENDERER_REVISION: u32 = 2;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderTarget {
@@ -70,8 +81,7 @@ impl GlassRenderer {
     }
 
     pub fn load_svg(&mut self, svg: &str) -> Result<(), IconError> {
-        let layers =
-            fit_layers_to_icon_frame(normalize_full_bleed_background(rasterize_layers(svg)?));
+        let layers = prepare_canonical_layers(svg)?;
         self.icon = Some(GlassIcon::new(
             &self.device,
             &self.queue,
@@ -216,24 +226,40 @@ impl GlassRenderer {
         let mut image = RgbaImage::from_raw(width, height, pixels)
             .ok_or_else(|| gpu_error("GPU returned an invalid RGBA image"))?;
         if target == RenderTarget::Icon {
-            apply_icon_mask(&mut image);
+            apply_canonical_mask(&mut image);
         }
         Ok(image)
     }
 }
 
-fn apply_icon_mask(image: &mut RgbaImage) {
+/// Single canonical rounded-square mask definition. The CPU path below and
+/// the WGPU shader (`glass_shader()`) share these exact constants so the
+/// preview and the exported icon never disagree about the icon edge.
+pub const MASK_RADIUS: f32 = 0.415;
+pub const MASK_EXPONENT: f32 = 4.2;
+pub const MASK_EDGE_START: f32 = 0.90;
+pub const MASK_EDGE_END: f32 = 1.00;
+
+fn mask_distance(uv: [f32; 2]) -> f32 {
+    let p_x = (uv[0] - 0.5).abs() / MASK_RADIUS;
+    let p_y = (uv[1] - 0.5).abs() / MASK_RADIUS;
+    p_x.powf(MASK_EXPONENT) + p_y.powf(MASK_EXPONENT)
+}
+
+fn mask_value(distance: f32) -> f32 {
+    let t = ((distance - MASK_EDGE_START) / (MASK_EDGE_END - MASK_EDGE_START)).clamp(0.0, 1.0);
+    1.0 - t * t * (3.0 - 2.0 * t)
+}
+
+/// Apply the canonical icon mask exactly once. Layer textures are never
+/// masked; only the final exported image is.
+pub fn apply_canonical_mask(image: &mut RgbaImage) {
     let width = image.width() as f32;
     let height = image.height() as f32;
     for (x, y, pixel) in image.enumerate_pixels_mut() {
         let uv_x = (x as f32 + 0.5) / width;
         let uv_y = (y as f32 + 0.5) / height;
-        let p_x = ((uv_x - 0.5) / 0.415).abs().powf(4.2);
-        let p_y = ((uv_y - 0.5) / 0.415).abs().powf(4.2);
-        let distance = p_x + p_y;
-        let edge = ((distance - 0.90) / 0.10).clamp(0.0, 1.0);
-        let edge = edge * edge * (3.0 - 2.0 * edge);
-        let mask = 1.0 - edge;
+        let mask = mask_value(mask_distance([uv_x, uv_y]));
         pixel[3] = (f32::from(pixel[3]) * mask).round() as u8;
     }
 }
@@ -282,7 +308,7 @@ fn create_pipeline(
     });
     let shader = device.create_shader_module(wgpu::ShaderModuleDescriptor {
         label: Some("liquid-glass-shader"),
-        source: wgpu::ShaderSource::Wgsl(GLASS_SHADER.into()),
+        source: wgpu::ShaderSource::Wgsl(glass_shader().into()),
     });
     let layout = device.create_pipeline_layout(&wgpu::PipelineLayoutDescriptor {
         label: Some("liquid-glass-pipeline-layout"),
@@ -445,127 +471,160 @@ pub fn appearance_index(appearance: Appearance) -> f32 {
     }
 }
 
-fn fit_layers_to_icon_frame(mut layers: Vec<RasterLayer>) -> Vec<RasterLayer> {
-    if layers
-        .iter()
-        .skip(1)
-        .any(|layer| is_full_canvas_layer(&layer.image))
-    {
+/// Rasterize a canonical SVG and run enclosure extraction plus Apple
+/// safe-zone fitting. Single entry point shared by the GPU loader,
+/// integration tests and tooling.
+pub fn prepare_canonical_layers(svg: &str) -> Result<Vec<RasterLayer>, IconError> {
+    Ok(fit_layers_to_icon_frame(extract_enclosure(
+        rasterize_layers(svg)?,
+    )))
+}
+
+/// A full-bleed circle or rounded-square sitting in the first foreground
+/// slot is an enclosure candidate: its color field moves into the background
+/// layer and the final rounded-square shape comes from the renderer mask.
+fn extract_enclosure(mut layers: Vec<RasterLayer>) -> Vec<RasterLayer> {
+    if layers.len() < 2 || !is_full_bleed_enclosure(&layers[1].image) {
         return layers;
     }
-    let Some((min_x, min_y, max_x, max_y)) = foreground_bounds(&layers) else {
-        return layers;
-    };
-    let source_width = max_x - min_x + 1;
-    let source_height = max_y - min_y + 1;
-    let scale = ICON_ARTWORK_SIZE as f32 / source_width.max(source_height) as f32;
-    let target_width = ((source_width as f32 * scale).round() as u32).max(1);
-    let target_height = ((source_height as f32 * scale).round() as u32).max(1);
-    let target_x = (CANVAS_SIZE - target_width) / 2;
-    let target_y = (CANVAS_SIZE - target_height) / 2;
-    for layer in layers.iter_mut().skip(1) {
-        let source =
-            imageops::crop_imm(&layer.image, min_x, min_y, source_width, source_height).to_image();
-        let resized = imageops::resize(
-            &source,
-            target_width,
-            target_height,
-            imageops::FilterType::Lanczos3,
-        );
-        let mut framed = RgbaImage::new(CANVAS_SIZE, CANVAS_SIZE);
-        imageops::overlay(
-            &mut framed,
-            &resized,
-            i64::from(target_x),
-            i64::from(target_y),
-        );
-        layer.image = framed;
-    }
+    let enclosure = layers.remove(1);
+    // Composite instead of flattening to a single color so gradients and
+    // color-field information survive into the background layer.
+    imageops::overlay(&mut layers[0].image, &enclosure.image, 0, 0);
     layers
 }
 
-fn normalize_full_bleed_background(mut layers: Vec<RasterLayer>) -> Vec<RasterLayer> {
-    let Some(background_layer) = layers.get(1) else {
-        return layers;
-    };
-    if !is_circle_background(&background_layer.image) {
-        return layers;
-    }
+const FULL_BLEED_SPAN: u32 = 982;
 
-    let center = background_layer
-        .image
-        .get_pixel(CANVAS_SIZE / 2, CANVAS_SIZE / 2);
-    let fill = [center[0], center[1], center[2]];
-    for pixel in layers[0].image.pixels_mut() {
-        pixel[0] = fill[0];
-        pixel[1] = fill[1];
-        pixel[2] = fill[2];
-        pixel[3] = 255;
-    }
-    for pixel in layers[1].image.pixels_mut() {
-        pixel[0] = fill[0];
-        pixel[1] = fill[1];
-        pixel[2] = fill[2];
-        pixel[3] = 255;
-    }
-    layers
-}
-
-fn is_circle_background(image: &RgbaImage) -> bool {
+/// Strict enclosure test: only near-canvas-filling shapes whose edge
+/// midpoints are opaque and whose corners stay transparent qualify. Smaller
+/// meaningful circles (eyes, badges, logo parts) are kept as artwork.
+fn is_full_bleed_enclosure(image: &RgbaImage) -> bool {
     if image.dimensions() != (CANVAS_SIZE, CANVAS_SIZE) {
         return false;
     }
     let edge = CANVAS_SIZE - 1;
     let center = CANVAS_SIZE / 2;
-    let edge_pixels = [
+    let midpoints = [
         image.get_pixel(0, center),
         image.get_pixel(edge, center),
         image.get_pixel(center, 0),
         image.get_pixel(center, edge),
     ];
-    let corner_pixels = [
+    let corners = [
         image.get_pixel(0, 0),
         image.get_pixel(edge, 0),
         image.get_pixel(0, edge),
         image.get_pixel(edge, edge),
     ];
-    edge_pixels.iter().all(|pixel| pixel[3] > 16) && corner_pixels.iter().all(|pixel| pixel[3] < 16)
-}
-
-fn is_full_canvas_layer(image: &RgbaImage) -> bool {
-    if image.dimensions() != (CANVAS_SIZE, CANVAS_SIZE) {
+    if !midpoints.iter().all(|pixel| pixel[3] >= 128) {
         return false;
     }
-    let edge = CANVAS_SIZE - 1;
-    [
-        image.get_pixel(0, 0),
-        image.get_pixel(edge, 0),
-        image.get_pixel(0, edge),
-        image.get_pixel(edge, edge),
-    ]
-    .iter()
-    .all(|pixel| pixel[3] > 200)
+    if !corners.iter().all(|pixel| pixel[3] <= 32) {
+        return false;
+    }
+    alpha_bounds(image).is_some_and(|(min_x, min_y, max_x, max_y)| {
+        max_x - min_x + 1 >= FULL_BLEED_SPAN && max_y - min_y + 1 >= FULL_BLEED_SPAN
+    })
 }
 
-fn foreground_bounds(layers: &[RasterLayer]) -> Option<(u32, u32, u32, u32)> {
+/// Apple safe-zone fitting. The background never participates; the combined
+/// alpha bounds of the artwork decide one shared transform:
+/// - inside the keep band and not clipped: keep source coordinates,
+///   only translate so the combined center sits at (512, 512);
+/// - too small: grow toward ~84% safe zone about that common center;
+/// - overflowing (touching a canvas edge): shrink with the same transform
+///   instead of enlarging the crop.
+///
+/// Layers are never scaled against their own bounding boxes.
+fn fit_layers_to_icon_frame(layers: Vec<RasterLayer>) -> Vec<RasterLayer> {
+    let Some(bounds @ (min_x, min_y, max_x, max_y)) = artwork_bounds(&layers) else {
+        return layers;
+    };
+    let source_width = (max_x - min_x + 1) as f32;
+    let source_height = (max_y - min_y + 1) as f32;
+    let max_dimension = source_width.max(source_height);
+    let touches_edge =
+        min_x == 0 || min_y == 0 || max_x == CANVAS_SIZE - 1 || max_y == CANVAS_SIZE - 1;
+    let scale = if max_dimension < SAFE_ZONE_KEEP_MIN
+        || (touches_edge && max_dimension > SAFE_ZONE_TARGET)
+    {
+        SAFE_ZONE_TARGET / max_dimension
+    } else {
+        1.0
+    };
+    apply_common_transform(layers, bounds, scale)
+}
+
+fn apply_common_transform(
+    mut layers: Vec<RasterLayer>,
+    (min_x, min_y, max_x, max_y): (u32, u32, u32, u32),
+    scale: f32,
+) -> Vec<RasterLayer> {
+    let source_width = max_x - min_x + 1;
+    let source_height = max_y - min_y + 1;
+    let target_width = ((source_width as f32 * scale).round() as u32).max(1);
+    let target_height = ((source_height as f32 * scale).round() as u32).max(1);
+    // One transform for every artwork layer: the combined bounding box keeps
+    // its internal layout while its center lands on the canvas center.
+    let target_x = (((CANVAS_SIZE as f32 - target_width as f32) / 2.0).round() as i64).max(0);
+    let target_y = (((CANVAS_SIZE as f32 - target_height as f32) / 2.0).round() as i64).max(0);
+    for layer in layers.iter_mut().skip(1) {
+        let cropped =
+            imageops::crop_imm(&layer.image, min_x, min_y, source_width, source_height).to_image();
+        let resized = if (scale - 1.0).abs() < f32::EPSILON {
+            cropped
+        } else {
+            imageops::resize(
+                &cropped,
+                target_width,
+                target_height,
+                imageops::FilterType::Lanczos3,
+            )
+        };
+        let mut framed = RgbaImage::new(CANVAS_SIZE, CANVAS_SIZE);
+        imageops::overlay(&mut framed, &resized, target_x, target_y);
+        layer.image = framed;
+    }
+    layers
+}
+
+fn alpha_bounds(image: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
     let mut min_x = CANVAS_SIZE;
     let mut min_y = CANVAS_SIZE;
     let mut max_x = 0;
     let mut max_y = 0;
     let mut found = false;
-    for layer in layers.iter().skip(1) {
-        for (x, y, pixel) in layer.image.enumerate_pixels() {
-            if pixel[3] <= 8 {
-                continue;
-            }
-            found = true;
-            min_x = min_x.min(x);
-            min_y = min_y.min(y);
-            max_x = max_x.max(x);
-            max_y = max_y.max(y);
+    for (x, y, pixel) in image.enumerate_pixels() {
+        if pixel[3] <= 8 {
+            continue;
         }
+        found = true;
+        min_x = min_x.min(x);
+        min_y = min_y.min(y);
+        max_x = max_x.max(x);
+        max_y = max_y.max(y);
     }
     found.then_some((min_x, min_y, max_x, max_y))
+}
+
+fn artwork_bounds(layers: &[RasterLayer]) -> Option<(u32, u32, u32, u32)> {
+    let mut bounds: Option<(u32, u32, u32, u32)> = None;
+    for layer in layers.iter().skip(1) {
+        let Some((min_x, min_y, max_x, max_y)) = alpha_bounds(&layer.image) else {
+            continue;
+        };
+        bounds = Some(match bounds {
+            None => (min_x, min_y, max_x, max_y),
+            Some((b_min_x, b_min_y, b_max_x, b_max_y)) => (
+                b_min_x.min(min_x),
+                b_min_y.min(min_y),
+                b_max_x.max(max_x),
+                b_max_y.max(max_y),
+            ),
+        });
+    }
+    bounds
 }
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
@@ -579,7 +638,7 @@ fn gpu_error(message: impl Into<String>) -> IconError {
     IconError::InvalidImage(format!("Liquid Glass GPU: {}", message.into()))
 }
 
-const GLASS_SHADER: &str = r#"
+const GLASS_SHADER_TEMPLATE: &str = r#"
 struct Params {
     accent: vec4<f32>,
     state: vec4<f32>,
@@ -617,16 +676,14 @@ fn preview_background(uv: vec2<f32>) -> vec3<f32> {
     return mix(vec3<f32>(0.76, 0.84, 0.96), vec3<f32>(0.96, 0.78, 0.88), wave);
 }
 
-fn icon_mask(uv: vec2<f32>) -> f32 {
-    let p = abs((uv - vec2<f32>(0.5)) / vec2<f32>(0.41));
-    let distance = pow(p.x, 4.2) + pow(p.y, 4.2);
-    return 1.0 - smoothstep(0.94, 1.0, distance);
+fn enclosure_distance(uv: vec2<f32>) -> f32 {
+    let p = abs((uv - vec2<f32>(0.5)) / vec2<f32>(@MASK_RADIUS@));
+    return pow(p.x, @MASK_EXPONENT@) + pow(p.y, @MASK_EXPONENT@);
 }
 
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let uv = input.uv;
-    let mask = icon_mask(uv);
     let source_background = textureSample(layers, layer_sampler, uv, 0);
     var color = source_background.rgb;
     var alpha = source_background.a;
@@ -634,7 +691,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     if params.pointer.z >= 0.0 {
         let selected_index = i32(params.pointer.z + 0.5);
         let selected = textureSample(layers, layer_sampler, uv, selected_index);
-        let selected_alpha = selected.a * mask;
+        let selected_alpha = selected.a;
         return vec4(mix(environment, selected.rgb, selected_alpha), 1.0);
     }
 
@@ -686,108 +743,301 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         glass_mix = select(0.50, 0.56, mode > 4.5);
     }
 
-    let edge = smoothstep(
-        0.58,
-        0.98,
-        pow(abs((uv.x - 0.5) / 0.41), 4.2) + pow(abs((uv.y - 0.5) / 0.41), 4.2),
-    );
     let refracted = select(color, environment, params.state.w < 0.5);
     var glass = mix(artwork, refracted, glass_mix);
-    let highlight = pow(max(0.0, 1.0 - distance(uv, vec2<f32>(0.5, 0.24)) * 1.8), 4.0) * 0.22;
-    glass = glass + vec3<f32>(highlight + edge * 0.10);
+    // Boundary-based lighting: one symmetric inner glow along the enclosure
+    // border plus the per-layer specular from alpha gradients above. No
+    // global tilted highlight — symmetric sources stay horizontally centered.
+    let rim_distance = enclosure_distance(uv);
+    let rim = smoothstep(0.78, 0.92, rim_distance)
+        * (1.0 - smoothstep(0.96, 1.02, rim_distance));
+    glass = glass + vec3<f32>(rim * 0.10);
 
     if params.state.w > 0.5 {
-        return vec4<f32>(glass, mask * alpha);
+        return vec4<f32>(glass, alpha);
     }
     let canvas = environment;
-    return vec4<f32>(mix(canvas, glass, mask * alpha), 1.0);
+    return vec4<f32>(mix(canvas, glass, alpha), 1.0);
 }
 "#;
+
+/// Build the shader source with the canonical mask constants injected so the
+/// GPU path and `apply_canonical_mask` share one mathematical definition.
+fn glass_shader() -> String {
+    GLASS_SHADER_TEMPLATE
+        .replace("@MASK_RADIUS@", &format!("{MASK_RADIUS}"))
+        .replace("@MASK_EXPONENT@", &format!("{MASK_EXPONENT}"))
+}
 
 #[cfg(test)]
 mod tests {
     use super::*;
 
-    #[test]
-    fn frames_non_square_foreground_inside_the_icon_frame() {
-        let mut background = RgbaImage::new(CANVAS_SIZE, CANVAS_SIZE);
-        for pixel in background.pixels_mut() {
-            *pixel = image::Rgba([0, 0, 0, 255]);
+    fn layer(id: &str, image: RgbaImage) -> RasterLayer {
+        RasterLayer {
+            id: id.to_owned(),
+            image,
         }
-        let mut foreground = RgbaImage::new(CANVAS_SIZE, CANVAS_SIZE);
-        for y in 40..980 {
-            for x in 140..900 {
-                foreground.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+    }
+
+    fn solid(id: &str, fill: [u8; 4]) -> RasterLayer {
+        layer(
+            id,
+            RgbaImage::from_pixel(CANVAS_SIZE, CANVAS_SIZE, image::Rgba(fill)),
+        )
+    }
+
+    fn rect_layer(id: &str, x0: u32, y0: u32, x1: u32, y1: u32, color: [u8; 4]) -> RasterLayer {
+        let mut canvas = RgbaImage::new(CANVAS_SIZE, CANVAS_SIZE);
+        for y in y0..y1 {
+            for x in x0..x1 {
+                canvas.put_pixel(x, y, image::Rgba(color));
             }
         }
-        let layers = fit_layers_to_icon_frame(vec![
-            RasterLayer {
-                id: "background".to_owned(),
-                image: background,
-            },
-            RasterLayer {
-                id: "foreground-1".to_owned(),
-                image: foreground,
-            },
-        ]);
-        let bounds = foreground_bounds(&layers).unwrap();
-        assert!(bounds.2 - bounds.0 < ICON_ARTWORK_SIZE + 2);
-        assert!(bounds.3 - bounds.1 < ICON_ARTWORK_SIZE + 2);
-        assert_eq!(layers[0].image.get_pixel(0, 0)[3], 255);
+        layer(id, canvas)
+    }
+
+    /// Vertical-gradient disc used as a full-bleed enclosure candidate.
+    fn gradient_disc(id: &str, radius: i64) -> RasterLayer {
+        let mut canvas = RgbaImage::new(CANVAS_SIZE, CANVAS_SIZE);
+        let center = CANVAS_SIZE as i64 / 2;
+        for y in 0..CANVAS_SIZE {
+            for x in 0..CANVAS_SIZE {
+                let dx = x as i64 - center;
+                let dy = y as i64 - center;
+                if dx * dx + dy * dy <= radius * radius {
+                    let color = if y < CANVAS_SIZE / 2 {
+                        [220, 50, 50, 255]
+                    } else {
+                        [40, 60, 230, 255]
+                    };
+                    canvas.put_pixel(x, y, image::Rgba(color));
+                }
+            }
+        }
+        layer(id, canvas)
+    }
+
+    /// Canvas-filling rounded square with transparent corners.
+    fn rounded_square(id: &str) -> RasterLayer {
+        let mut canvas = RgbaImage::new(CANVAS_SIZE, CANVAS_SIZE);
+        let lo = 0i64;
+        let hi = CANVAS_SIZE as i64 - 1;
+        let radius = 180i64;
+        let band = lo + radius;
+        for y in lo..=hi {
+            for x in lo..=hi {
+                let corner = if x < band && y < band {
+                    Some((band, band))
+                } else if x > hi - radius && y < band {
+                    Some((hi - radius, band))
+                } else if x < band && y > hi - radius {
+                    Some((band, hi - radius))
+                } else if x > hi - radius && y > hi - radius {
+                    Some((hi - radius, hi - radius))
+                } else {
+                    None
+                };
+                let inside = match corner {
+                    None => true,
+                    Some((cx, cy)) => {
+                        let dx = x - cx;
+                        let dy = y - cy;
+                        dx * dx + dy * dy <= radius * radius
+                    }
+                };
+                if inside {
+                    canvas.put_pixel(x as u32, y as u32, image::Rgba([255, 255, 255, 255]));
+                }
+            }
+        }
+        layer(id, canvas)
     }
 
     #[test]
-    fn normalizes_full_bleed_circle_into_the_system_mask() {
-        let mut background = RgbaImage::new(CANVAS_SIZE, CANVAS_SIZE);
-        for pixel in background.pixels_mut() {
-            *pixel = image::Rgba([0, 0, 0, 255]);
-        }
-        let mut circle = RgbaImage::new(CANVAS_SIZE, CANVAS_SIZE);
-        for pixel in circle.pixels_mut() {
-            *pixel = image::Rgba([88, 101, 242, 255]);
-        }
-        for (x, y) in [
-            (0, 0),
-            (CANVAS_SIZE - 1, 0),
-            (0, CANVAS_SIZE - 1),
-            (CANVAS_SIZE - 1, CANVAS_SIZE - 1),
-        ] {
-            circle.put_pixel(x, y, image::Rgba([88, 101, 242, 0]));
-        }
-        let mut logo = RgbaImage::new(CANVAS_SIZE, CANVAS_SIZE);
-        for y in 200..300 {
-            for x in 200..300 {
-                logo.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+    fn background_never_joins_artwork_bounds_and_keep_band_keeps_coordinates() {
+        let background = solid("background", [0, 0, 0, 255]);
+        // 760×940 artwork sits inside the keep band, away from every edge:
+        // source coordinates survive, only the shared centering translation
+        // is applied. If the opaque background joined the measurement the
+        // artwork would be shrunk instead.
+        let foreground = rect_layer("foreground-1", 140, 40, 900, 980, [255, 255, 255, 255]);
+        let fitted = fit_layers_to_icon_frame(vec![background, foreground]);
+        let (min_x, min_y, max_x, max_y) = artwork_bounds(&fitted).unwrap();
+        assert_eq!(max_x - min_x + 1, 760);
+        assert_eq!(max_y - min_y + 1, 940);
+        let center_x = f32::from((min_x + max_x + 1) as u16) / 2.0;
+        let center_y = f32::from((min_y + max_y + 1) as u16) / 2.0;
+        assert!((center_x - 512.0).abs() <= 1.0, "center_x {center_x}");
+        assert!((center_y - 512.0).abs() <= 1.0, "center_y {center_y}");
+        assert_eq!(fitted[0].image.get_pixel(0, 0)[3], 255);
+    }
+
+    #[test]
+    fn small_artwork_grows_to_safe_zone_about_common_center() {
+        let background = solid("background", [0, 0, 0, 255]);
+        let foreground = rect_layer("foreground-1", 462, 462, 562, 562, [255, 255, 255, 255]);
+        let fitted = fit_layers_to_icon_frame(vec![background, foreground]);
+        let (min_x, min_y, max_x, max_y) = artwork_bounds(&fitted).unwrap();
+        let width = max_x - min_x + 1;
+        let height = max_y - min_y + 1;
+        assert!(
+            (width as i32 - SAFE_ZONE_TARGET as i32).abs() <= 4,
+            "width {width}"
+        );
+        assert!(
+            (height as i32 - SAFE_ZONE_TARGET as i32).abs() <= 4,
+            "height {height}"
+        );
+        let center_x = f32::from((min_x + max_x + 1) as u16) / 2.0;
+        let center_y = f32::from((min_y + max_y + 1) as u16) / 2.0;
+        assert!((center_x - 512.0).abs() <= 3.0, "center_x {center_x}");
+        assert!((center_y - 512.0).abs() <= 3.0, "center_y {center_y}");
+    }
+
+    #[test]
+    fn oversized_artwork_shrinks_instead_of_being_cropped() {
+        let background = solid("background", [0, 0, 0, 255]);
+        let flood = rect_layer(
+            "foreground-1",
+            0,
+            0,
+            CANVAS_SIZE,
+            CANVAS_SIZE,
+            [255, 255, 255, 255],
+        );
+        let marker = rect_layer("foreground-2", 100, 100, 140, 140, [10, 10, 10, 255]);
+        let fitted = fit_layers_to_icon_frame(vec![background, flood, marker]);
+        let (min_x, min_y, max_x, _max_y) = artwork_bounds(&fitted).unwrap();
+        let width = max_x - min_x + 1;
+        assert!(
+            (width as i32 - SAFE_ZONE_TARGET as i32).abs() <= 4,
+            "width {width}"
+        );
+        assert!(min_x > 0 && min_y > 0);
+        // The marker survives the shared downscale at the expected spot:
+        // crop offset (82) plus its scaled position inside the bounding box.
+        let scale = SAFE_ZONE_TARGET / CANVAS_SIZE as f32;
+        let offset = ((CANVAS_SIZE as f32 - (CANVAS_SIZE as f32 * scale).round()) / 2.0).round();
+        let expected = offset + 120.0 * scale;
+        let mut sum_x = 0.0f32;
+        let mut sum_y = 0.0f32;
+        let mut count = 0u32;
+        for (x, y, pixel) in fitted[2].image.enumerate_pixels() {
+            if pixel[3] > 128 {
+                sum_x += x as f32;
+                sum_y += y as f32;
+                count += 1;
             }
         }
+        assert!(count > 0, "marker was cropped away");
+        let centroid_x = sum_x / count as f32;
+        let centroid_y = sum_y / count as f32;
+        assert!(
+            (centroid_x - expected).abs() <= 8.0,
+            "marker x {centroid_x} vs {expected}"
+        );
+        assert!(
+            (centroid_y - expected).abs() <= 8.0,
+            "marker y {centroid_y} vs {expected}"
+        );
+    }
 
-        let layers = normalize_full_bleed_background(vec![
-            RasterLayer {
-                id: "background".to_owned(),
-                image: background,
-            },
-            RasterLayer {
-                id: "foreground-1".to_owned(),
-                image: circle,
-            },
-            RasterLayer {
-                id: "foreground-2".to_owned(),
-                image: logo,
-            },
+    #[test]
+    fn artwork_layers_share_one_common_transform() {
+        let background = solid("background", [0, 0, 0, 255]);
+        let back = rect_layer("foreground-1", 200, 200, 400, 400, [255, 255, 255, 255]);
+        let front = rect_layer("foreground-2", 600, 600, 800, 800, [255, 0, 0, 255]);
+        let fitted = fit_layers_to_icon_frame(vec![background, back, front]);
+        let bounds_of = |layer: &RasterLayer| alpha_bounds(&layer.image).unwrap();
+        let (a_min_x, _a_min_y, a_max_x, _a_max_y) = bounds_of(&fitted[1]);
+        let (b_min_x, _b_min_y, b_max_x, _b_max_y) = bounds_of(&fitted[2]);
+        let a_width = a_max_x - a_min_x + 1;
+        let b_width = b_max_x - b_min_x + 1;
+        // Per-layer fitting would blow each 200 px rect up to the safe zone
+        // on its own; the shared transform scales them identically instead.
+        assert!((a_width as i32 - 287).abs() <= 3, "a_width {a_width}");
+        assert!((b_width as i32 - 287).abs() <= 3, "b_width {b_width}");
+        assert!((a_width as i32 - b_width as i32).abs() <= 2);
+        let a_center = f32::from((a_min_x + a_max_x + 1) as u16) / 2.0;
+        let b_center = f32::from((b_min_x + b_max_x + 1) as u16) / 2.0;
+        let gap = b_center - a_center;
+        let expected_gap = 400.0 * (SAFE_ZONE_TARGET / 600.0);
+        assert!((gap - expected_gap).abs() <= 6.0, "gap {gap}");
+    }
+
+    #[test]
+    fn full_bleed_first_circle_becomes_the_background_color_field() {
+        let background = solid("background", [30, 160, 80, 255]);
+        let circle = gradient_disc("foreground-1", 512);
+        let logo = rect_layer("foreground-2", 200, 200, 300, 300, [255, 255, 255, 255]);
+        let layers = extract_enclosure(vec![background, circle, logo]);
+        assert_eq!(layers.len(), 2);
+        assert_eq!(layers[1].id, "foreground-2");
+        // The gradient survives into the background instead of being
+        // flattened to one solid center color.
+        let top = layers[0].image.get_pixel(512, 80);
+        let bottom = layers[0].image.get_pixel(512, 944);
+        assert!(top[0] > top[1] && top[0] > top[2], "top {top:?}");
+        assert!(
+            bottom[2] > bottom[0] && bottom[2] > bottom[1],
+            "bottom {bottom:?}"
+        );
+        assert_ne!(top.0, bottom.0);
+        assert_eq!(layers[1].image.get_pixel(250, 250)[3], 255);
+    }
+
+    #[test]
+    fn enclosure_detection_stays_strict() {
+        let background = solid("background", [30, 160, 80, 255]);
+        // A circle in a later slot is meaningful artwork and stays.
+        let kept = extract_enclosure(vec![
+            background.clone(),
+            rect_layer("foreground-1", 400, 400, 500, 500, [255, 255, 255, 255]),
+            gradient_disc("foreground-2", 512),
+            rect_layer("foreground-3", 700, 700, 760, 760, [10, 10, 10, 255]),
         ]);
-        assert_eq!(layers[0].image.get_pixel(0, 0).0, [88, 101, 242, 255]);
-        assert_eq!(layers[1].image.get_pixel(0, 0).0, [88, 101, 242, 255]);
-        let fitted = fit_layers_to_icon_frame(layers);
-        assert_eq!(fitted[1].image.dimensions(), (CANVAS_SIZE, CANVAS_SIZE));
-        assert_eq!(fitted[2].image.get_pixel(200, 200)[3], 255);
-        assert_eq!(fitted[2].image.get_pixel(150, 150)[3], 0);
+        assert_eq!(kept.len(), 4);
+        assert_eq!(kept[2].image.get_pixel(0, 0)[3], 0);
 
-        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
-<g id="background"><rect width="1024" height="1024" fill="#000000"/></g>
-<g id="foreground-1"><circle cx="512" cy="512" r="512" fill="#5865F2"/></g>
-</svg>"##;
-        let actual = normalize_full_bleed_background(rasterize_layers(svg).unwrap());
-        assert!(is_full_canvas_layer(&actual[1].image));
+        // Small circles never qualify as enclosures.
+        let small = extract_enclosure(vec![background.clone(), gradient_disc("foreground-1", 300)]);
+        assert_eq!(small.len(), 2);
+        assert_eq!(small[1].image.get_pixel(0, 0)[3], 0);
+
+        // A full-bleed rounded square is also an enclosure.
+        let rounded = extract_enclosure(vec![background.clone(), rounded_square("foreground-1")]);
+        assert_eq!(rounded.len(), 1);
+        assert_eq!(rounded[0].image.get_pixel(512, 60).0, [255, 255, 255, 255]);
+        // Corners of the rounded square stay transparent over the old fill.
+        assert_eq!(rounded[0].image.get_pixel(2, 2).0, [30, 160, 80, 255]);
+    }
+
+    #[test]
+    fn canonical_mask_is_centered_feathered_and_shared_with_shader() {
+        assert_eq!(mask_value(mask_distance([0.5, 0.5])), 1.0);
+        assert_eq!(mask_value(mask_distance([0.0, 0.0])), 0.0);
+        assert_eq!(
+            mask_value(mask_distance([0.5 - MASK_RADIUS * 0.85, 0.5])),
+            1.0
+        );
+        let mid_edge = mask_value(mask_distance([0.5 + MASK_RADIUS * 0.99, 0.5]));
+        assert!(mid_edge > 0.0 && mid_edge < 1.0, "edge feather {mid_edge}");
+        assert_eq!(
+            mask_value(mask_distance([0.5 + MASK_RADIUS * 1.02, 0.5])),
+            0.0
+        );
+
+        let mut image = RgbaImage::from_pixel(128, 128, image::Rgba([90, 90, 90, 255]));
+        apply_canonical_mask(&mut image);
+        assert_eq!(image.get_pixel(64, 64)[3], 255);
+        assert_eq!(image.get_pixel(0, 0)[3], 0);
+        assert!(image.get_pixel(0, 64)[3] < 10);
+
+        let shader = glass_shader();
+        assert!(shader.contains("0.415"), "mask radius missing");
+        assert!(shader.contains("4.2"), "mask exponent missing");
+        assert!(!shader.contains("@MASK_"), "unresolved placeholder");
     }
 
     #[tokio::test]
@@ -844,5 +1094,78 @@ mod tests {
             .unwrap();
         assert!(selected.get_pixel(64, 64)[0] > 200);
         assert!(selected.get_pixel(64, 64)[1] < 100);
+    }
+
+    #[tokio::test]
+    async fn symmetric_source_stays_horizontally_centered() {
+        let Ok(mut renderer) = GlassRenderer::new().await else {
+            return;
+        };
+        renderer
+            .load_svg(
+                r##"<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<g id="background"><rect width="1024" height="1024" fill="#203050"/></g>
+<g id="foreground-1"><circle cx="512" cy="512" r="300" fill="#5865F2"/></g>
+<g id="foreground-2"><circle cx="392" cy="430" r="48" fill="#ffffff"/><circle cx="632" cy="430" r="48" fill="#ffffff"/></g>
+<g id="foreground-3"><path d="M392,640 Q512,752 632,640" stroke="#ffffff" stroke-width="36" fill="none"/></g>
+</svg>"##,
+            )
+            .unwrap();
+        let image = renderer
+            .render(256, 256, RenderSettings::default(), RenderTarget::Icon)
+            .unwrap();
+        let mut left = 0u64;
+        let mut right = 0u64;
+        let mut weighted_x = 0u64;
+        let mut total = 0u64;
+        for (x, _y, pixel) in image.enumerate_pixels() {
+            let alpha = u64::from(pixel[3]);
+            if x < 128 {
+                left += alpha;
+            } else {
+                right += alpha;
+            }
+            weighted_x += u64::from(x) * alpha;
+            total += alpha;
+        }
+        assert!(total > 0);
+        let asymmetry = left.abs_diff(right) as f64 / (left + right) as f64;
+        assert!(
+            asymmetry <= 0.02,
+            "horizontal asymmetry {asymmetry} (left {left}, right {right})"
+        );
+        let centroid_x = weighted_x as f64 / total as f64;
+        assert!((centroid_x - 127.5).abs() <= 2.0, "centroid_x {centroid_x}");
+    }
+
+    #[tokio::test]
+    async fn every_layer_view_renders_without_crashing() {
+        use std::fs;
+        let Ok(mut renderer) = GlassRenderer::new().await else {
+            return;
+        };
+        let discord_svg = std::env::var("HOME")
+            .ok()
+            .map(|home| home + "/.local/share/liquid-glass-icon/out/apps/discord/icon.svg");
+        let svg = discord_svg
+            .and_then(|path| fs::read_to_string(path).ok())
+            .expect("no svg fixture available");
+        renderer.load_svg(&svg).unwrap();
+        let count = renderer.layer_count();
+        assert!(count >= 1);
+        for layer in 0..count {
+            let settings = RenderSettings {
+                layer: Some(layer),
+                ..RenderSettings::default()
+            };
+            let image = renderer
+                .render(520, 520, settings, RenderTarget::Preview)
+                .unwrap();
+            assert_eq!(image.dimensions(), (520, 520));
+        }
+        let composite = renderer
+            .render(520, 520, RenderSettings::default(), RenderTarget::Icon)
+            .unwrap();
+        assert_eq!(composite.dimensions(), (520, 520));
     }
 }

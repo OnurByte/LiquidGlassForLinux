@@ -11,7 +11,7 @@ use liquid_glass_icon::{
     icon_install::IconInstaller,
     openai::{CodexExecProvider, DEFAULT_MODEL, OpenAiResponsesClient, SvgProvider},
     pipeline::{CacheStatus, cache_status, transform_desktop_icons_with_options},
-    renderer::{GlassRenderer, RenderSettings, RenderTarget},
+    renderer::{GlassRenderer, RenderSettings, RenderTarget, apply_canonical_mask},
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -274,7 +274,12 @@ impl IconApp {
                     .map_err(|error| error.to_string())
             });
         match result {
-            Ok(image) => self.set_preview(image),
+            Ok(mut image) => {
+                // The shader no longer masks output alpha; every preview view
+                // (composite and single layers) gets the one canonical mask.
+                apply_canonical_mask(&mut image);
+                self.set_preview(image);
+            }
             Err(error) => {
                 self.preview.set_paintable(Option::<&gdk::Paintable>::None);
                 self.status.set_text(&error);
@@ -304,7 +309,9 @@ impl IconApp {
             .filter(|layer| *layer < layer_count)
             .map(|layer| layer + 1)
             .unwrap_or(0);
-        self.preview_layer = (selected > 0).then_some(selected - 1);
+        // then_some would evaluate `selected - 1` eagerly and underflow when
+        // Composite (0) is selected; the closure keeps it lazy.
+        self.preview_layer = (selected > 0).then(|| selected - 1);
         self.preview_selector_updating.set(true);
         self.preview_selector
             .set_model(Some(&gtk::StringList::new(&label_refs)));
@@ -313,7 +320,7 @@ impl IconApp {
     }
 
     fn set_preview_layer(&mut self, selected: u32) {
-        self.preview_layer = (selected > 0).then_some(selected as usize - 1);
+        self.preview_layer = (selected > 0).then(|| selected as usize - 1);
         if let Some(index) = self.selected {
             self.load_preview(index);
         }

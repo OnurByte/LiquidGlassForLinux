@@ -647,3 +647,233 @@ async fn stopping_api_cancels_the_active_http_request() {
         Err(liquid_glass_icon::IconError::Cancelled)
     ));
 }
+
+fn combined_bounds(layers: &[liquid_glass_icon::svg::RasterLayer]) -> Option<(u32, u32, u32, u32)> {
+    let mut bounds: Option<(u32, u32, u32, u32)> = None;
+    for layer in layers.iter().skip(1) {
+        let mut current: Option<(u32, u32, u32, u32)> = None;
+        for (x, y, pixel) in layer.image.enumerate_pixels() {
+            if pixel[3] <= 8 {
+                continue;
+            }
+            current = Some(match current {
+                None => (x, y, x, y),
+                Some((min_x, min_y, max_x, max_y)) => {
+                    (min_x.min(x), min_y.min(y), max_x.max(x), max_y.max(y))
+                }
+            });
+        }
+        if let Some((min_x, min_y, max_x, max_y)) = current {
+            bounds = Some(match bounds {
+                None => (min_x, min_y, max_x, max_y),
+                Some((b0, b1, b2, b3)) => {
+                    (b0.min(min_x), b1.min(min_y), b2.max(max_x), b3.max(max_y))
+                }
+            });
+        }
+    }
+    bounds
+}
+
+fn row_extent(layer: &liquid_glass_icon::svg::RasterLayer, y: u32) -> Option<(u32, u32)> {
+    let mut min_x = None;
+    let mut max_x = None;
+    for x in 0..layer.image.width() {
+        if layer.image.get_pixel(x, y)[3] > 128 {
+            min_x = Some(min_x.unwrap_or(x));
+            max_x = Some(x);
+        }
+    }
+    min_x.zip(max_x)
+}
+
+fn column_extent(layer: &liquid_glass_icon::svg::RasterLayer, x: u32) -> Option<(u32, u32)> {
+    let mut min_y = None;
+    let mut max_y = None;
+    for y in 0..layer.image.height() {
+        if layer.image.get_pixel(x, y)[3] > 128 {
+            min_y = Some(min_y.unwrap_or(y));
+            max_y = Some(y);
+        }
+    }
+    min_y.zip(max_y)
+}
+
+#[test]
+fn bridge_space_panels_fill_safe_zone_with_one_shared_transform() {
+    let fitted = liquid_glass_icon::renderer::prepare_canonical_layers(&four_group_svg()).unwrap();
+    assert_eq!(fitted.len(), 5);
+    let (min_x, min_y, max_x, max_y) = combined_bounds(&fitted).unwrap();
+    let width = max_x - min_x + 1;
+    let height = max_y - min_y + 1;
+    assert!((width as i32 - 860).abs() <= 6, "width {width}");
+    assert!((height as i32 - 860).abs() <= 6, "height {height}");
+    let center_x = f32::from((min_x + max_x + 1) as u16) / 2.0;
+    let center_y = f32::from((min_y + max_y + 1) as u16) / 2.0;
+    assert!((center_x - 512.0).abs() <= 4.0);
+    assert!((center_y - 512.0).abs() <= 4.0);
+
+    // Every panel keeps its own optical weight under the shared transform:
+    // the outer disc fills the band, the inner disc scales proportionally,
+    // and the thin bar stays thin instead of being fitted on its own.
+    let outer = row_extent(&fitted[1], 512).unwrap();
+    assert!(((outer.1 - outer.0 + 1) as i32 - 860).abs() <= 12);
+    let inner = row_extent(&fitted[2], 512).unwrap();
+    let inner_width = inner.1 - inner.0 + 1;
+    assert!(
+        (inner_width as i32 - 553).abs() <= 14,
+        "inner disc width {inner_width}"
+    );
+    let bar_height = {
+        let (top, bottom) = column_extent(&fitted[3], 512).unwrap();
+        bottom - top + 1
+    };
+    assert!(bar_height < 90, "bar grew to {bar_height}");
+}
+
+#[test]
+fn athas_like_asymmetric_source_keeps_orientation_without_mirroring() {
+    let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<g id="background"><rect width="1024" height="1024" fill="#25202a"/></g>
+<g id="foreground-1"><rect x="150" y="380" width="300" height="280" rx="24" fill="#e8eaf0"/></g>
+<g id="foreground-2"><circle cx="700" cy="520" r="110" fill="#f2b23c"/></g>
+</svg>"##;
+    let source = rasterize_layers(svg).unwrap();
+    let fitted = liquid_glass_icon::renderer::prepare_canonical_layers(svg).unwrap();
+
+    let side_mass = |layers: &[liquid_glass_icon::svg::RasterLayer]| -> (u64, u64, f64) {
+        let mut left = 0u64;
+        let mut right = 0u64;
+        let mut weighted_x = 0u64;
+        let mut total = 0u64;
+        for layer in layers.iter().skip(1) {
+            for (x, _y, pixel) in layer.image.enumerate_pixels() {
+                let alpha = u64::from(pixel[3]);
+                if alpha == 0 {
+                    continue;
+                }
+                if x < 512 {
+                    left += alpha;
+                } else {
+                    right += alpha;
+                }
+                weighted_x += u64::from(x) * alpha;
+                total += alpha;
+            }
+        }
+        assert!(total > 0);
+        (left, right, weighted_x as f64 / total as f64)
+    };
+
+    let (source_left, source_right, source_centroid_x) = side_mass(&source);
+    let (fitted_left, fitted_right, fitted_centroid_x) = side_mass(&fitted);
+    let source_ratio = source_left as f64 / source_right.max(1) as f64;
+    let fitted_ratio = fitted_left as f64 / fitted_right.max(1) as f64;
+    // Left-heavy artwork stays left-heavy: no mirroring, only recentering.
+    assert!(source_ratio > 1.5, "fixture should be asymmetric");
+    assert!(
+        (source_ratio - fitted_ratio).abs() / source_ratio <= 0.08,
+        "orientation changed: {source_ratio} -> {fitted_ratio}"
+    );
+    // The alpha centroid follows the shared transform exactly (it is not
+    // forced to 512 — only the combined bounding-box center is).
+    let source_bounds = combined_bounds(&source).unwrap();
+    let fitted_bounds = combined_bounds(&fitted).unwrap();
+    let source_span = (source_bounds.2 - source_bounds.0 + 1) as f64;
+    let scale = (fitted_bounds.2 - fitted_bounds.0 + 1) as f64 / source_span;
+    let mapped =
+        f64::from(fitted_bounds.0) + (source_centroid_x - f64::from(source_bounds.0)) * scale;
+    assert!(
+        (fitted_centroid_x - mapped).abs() <= 4.0,
+        "centroid drifted {fitted_centroid_x} vs {mapped}"
+    );
+    let fitted_center = (f64::from(fitted_bounds.0) + f64::from(fitted_bounds.2) + 1.0) / 2.0;
+    assert!(
+        (fitted_center - 512.0).abs() <= 2.0,
+        "bounds center {fitted_center}"
+    );
+}
+
+#[tokio::test]
+async fn renderer_revision_change_rebuilds_managed_icons_without_ai() {
+    let root = tempdir().unwrap();
+    let data_home = root.path().join("data");
+    let installer =
+        liquid_glass_icon::icon_install::IconInstaller::with_data_home_for_test(data_home.clone());
+    let application = application(root.path(), &png_bytes([12, 34, 56, 255]));
+    fs::write(
+        &application.desktop_file,
+        "[Desktop Entry]\nType=Application\nName=Demo\nIcon=demo\nCategories=Development;\n",
+    )
+    .unwrap();
+    let mut renderer = liquid_glass_icon::renderer::GlassRenderer::new()
+        .await
+        .unwrap();
+    installer
+        .apply_svg(
+            &application,
+            &canonical_svg(),
+            &mut renderer,
+            liquid_glass_icon::renderer::RenderSettings {
+                appearance: Appearance::TintedLight,
+                ..Default::default()
+            },
+        )
+        .unwrap();
+    let desktop_path = data_home.join("applications/demo.desktop");
+    let desktop = fs::read_to_string(&desktop_path).unwrap();
+    let first_icon = desktop
+        .lines()
+        .find_map(|line| line.strip_prefix("Icon="))
+        .unwrap()
+        .to_owned();
+
+    // Simulate state written by an older renderer: the revision field is
+    // missing entirely, so the managed PNGs must be rebuilt from the cached
+    // canonical SVG without any AI request.
+    let state_path = data_home.join("liquid-glass-icon/managed-icons.json");
+    let mut state: serde_json::Value =
+        serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    state["entries"]["demo.desktop"]
+        .as_object_mut()
+        .unwrap()
+        .remove("renderer_revision");
+    fs::write(&state_path, serde_json::to_vec(&state).unwrap()).unwrap();
+
+    installer
+        .apply_svg(
+            &application,
+            &canonical_svg(),
+            &mut renderer,
+            liquid_glass_icon::renderer::RenderSettings {
+                appearance: Appearance::TintedLight,
+                accent: [255, 88, 120],
+                ..Default::default()
+            },
+        )
+        .unwrap();
+
+    let state: serde_json::Value = serde_json::from_slice(&fs::read(&state_path).unwrap()).unwrap();
+    assert_eq!(
+        state["entries"]["demo.desktop"]["renderer_revision"],
+        u64::from(liquid_glass_icon::renderer::RENDERER_REVISION)
+    );
+    // The desktop entry points at the freshly rendered family and every old
+    // family file is gone (the stale tilted-PNG reference problem).
+    let desktop = fs::read_to_string(&desktop_path).unwrap();
+    let second_icon = desktop
+        .lines()
+        .find_map(|line| line.strip_prefix("Icon="))
+        .unwrap();
+    assert_ne!(first_icon, second_icon);
+    for size in [128u32, 256, 512] {
+        let active = data_home
+            .join("icons/hicolor")
+            .join(format!("{size}x{size}/apps/{second_icon}.png"));
+        assert!(active.is_file());
+        let stale = data_home
+            .join("icons/hicolor")
+            .join(format!("{size}x{size}/apps/{first_icon}.png"));
+        assert!(!stale.exists());
+    }
+}
