@@ -35,6 +35,68 @@ use std::{
 
 const APPLICATION_ID: &str = "io.github.yargc.LiquidGlassIcons";
 const MODEL_OPTIONS: [&str; 4] = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.4"];
+const GNOME_PARALLAX_UUID: &str = "liquid-glass-parallax@onurbyte.github.io";
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum DesktopEnvironment {
+    Gnome,
+    Kde,
+    Hyprland,
+    Other,
+}
+
+fn desktop_environment(value: Option<&str>) -> DesktopEnvironment {
+    let value = value.unwrap_or_default().to_ascii_lowercase();
+    if value.contains("gnome") {
+        DesktopEnvironment::Gnome
+    } else if value.contains("kde") || value.contains("plasma") {
+        DesktopEnvironment::Kde
+    } else if value.contains("hyprland") {
+        DesktopEnvironment::Hyprland
+    } else {
+        DesktopEnvironment::Other
+    }
+}
+
+fn current_desktop_environment() -> DesktopEnvironment {
+    desktop_environment(std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref())
+}
+
+fn gnome_parallax_installed() -> bool {
+    let user_data = std::env::var_os("XDG_DATA_HOME")
+        .map(PathBuf::from)
+        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")));
+    user_data
+        .into_iter()
+        .map(|data| {
+            data.join("gnome-shell/extensions")
+                .join(GNOME_PARALLAX_UUID)
+                .join("metadata.json")
+        })
+        .chain(std::iter::once(
+            PathBuf::from("/usr/share/gnome-shell/extensions")
+                .join(GNOME_PARALLAX_UUID)
+                .join("metadata.json"),
+        ))
+        .any(|path| path.is_file())
+}
+
+fn inactive_desktop_message(
+    current: DesktopEnvironment,
+    target: DesktopEnvironment,
+) -> &'static str {
+    if current == target {
+        match target {
+            DesktopEnvironment::Kde | DesktopEnvironment::Hyprland => {
+                "Static Liquid Glass icons are active; no extension is required."
+            }
+            DesktopEnvironment::Gnome => "GNOME Shell is active.",
+            DesktopEnvironment::Other => "No supported desktop environment was detected.",
+        }
+    } else {
+        "You are not using this desktop environment."
+    }
+}
 
 fn preview_layer_from_selection(selected: u32) -> Option<usize> {
     selected.checked_sub(1).map(|layer| layer as usize)
@@ -319,22 +381,26 @@ impl IconApp {
         }
     }
 
-    fn install_gnome_parallax(&mut self) {
+    fn install_gnome_parallax(&mut self) -> bool {
         let script =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install-gnome-parallax.sh");
         match Command::new(&script).arg("--system").output() {
             Ok(output) if output.status.success() => {
                 let message = String::from_utf8_lossy(&output.stdout);
                 self.status.set_text(message.trim());
+                gnome_parallax_installed()
             }
             Ok(output) => {
                 let message = String::from_utf8_lossy(&output.stderr);
                 self.status
                     .set_text(&format!("GNOME extension: {}", message.trim()));
+                false
             }
-            Err(error) => self
-                .status
-                .set_text(&format!("GNOME extension installer unavailable: {error}")),
+            Err(error) => {
+                self.status
+                    .set_text(&format!("GNOME extension installer unavailable: {error}"));
+                false
+            }
         }
     }
 
@@ -1179,20 +1245,41 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     let integrations = gtk::Box::new(gtk::Orientation::Vertical, 10);
     integrations.add_css_class("card");
     integrations.append(&section_label("Desktop integrations"));
+    let desktop = current_desktop_environment();
     let gnome_install = gtk::Button::with_label("Install GNOME parallax (admin)");
     gnome_install.set_tooltip_text(Some(
         "Prompts for your administrator password, installs system-wide, then enables the GNOME Shell extension",
     ));
+    let gnome_installed = gtk::Label::new(None);
+    gnome_installed.set_halign(gtk::Align::Start);
+    let gnome_logout = gtk::Button::with_label("Log out to activate");
+    gnome_logout.set_tooltip_text(Some(
+        "Asks GNOME to log out so the new extension is loaded on the next session",
+    ));
+    let gnome_action = gtk::Box::new(gtk::Orientation::Horizontal, 8);
+    gnome_action.append(&gnome_install);
+    gnome_action.append(&gnome_installed);
+    gnome_action.append(&gnome_logout);
+    let gnome_active = desktop == DesktopEnvironment::Gnome;
+    let extension_installed = gnome_active && gnome_parallax_installed();
+    gnome_install.set_visible(gnome_active && !extension_installed);
+    gnome_installed.set_text(if extension_installed {
+        "Installed"
+    } else {
+        inactive_desktop_message(desktop, DesktopEnvironment::Gnome)
+    });
+    gnome_logout.set_visible(extension_installed);
     let integrations_grid = gtk::Grid::new();
     integrations_grid.set_column_spacing(12);
     integrations_grid.set_row_spacing(8);
     integrations_grid.attach(&field_label("GNOME Shell"), 0, 0, 1, 1);
-    integrations_grid.attach(&gnome_install, 1, 0, 1, 1);
+    integrations_grid.attach(&gnome_action, 1, 0, 1, 1);
     integrations_grid.attach(&field_label("KDE Plasma"), 0, 1, 1, 1);
     integrations_grid.attach(
-        &gtk::Label::new(Some(
-            "Static Liquid Glass icons are supported; no fragile launcher patch.",
-        )),
+        &gtk::Label::new(Some(inactive_desktop_message(
+            desktop,
+            DesktopEnvironment::Kde,
+        ))),
         1,
         1,
         1,
@@ -1200,9 +1287,10 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     );
     integrations_grid.attach(&field_label("Hyprland"), 0, 2, 1, 1);
     integrations_grid.attach(
-        &gtk::Label::new(Some(
-            "Static Liquid Glass icons are supported; dynamic panel ownership varies.",
-        )),
+        &gtk::Label::new(Some(inactive_desktop_message(
+            desktop,
+            DesktopEnvironment::Hyprland,
+        ))),
         1,
         2,
         1,
@@ -1359,10 +1447,31 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
             state_for_refresh.borrow_mut().refresh_applications();
         });
         let state_for_gnome_install = Rc::clone(&state);
+        let gnome_install_after_success = gnome_install.clone();
+        let gnome_installed_after_success = gnome_installed.clone();
+        let gnome_logout_after_success = gnome_logout.clone();
         gnome_install.connect_clicked(move |_| {
-            state_for_gnome_install
+            if state_for_gnome_install
                 .borrow_mut()
-                .install_gnome_parallax();
+                .install_gnome_parallax()
+            {
+                gnome_install_after_success.set_visible(false);
+                gnome_installed_after_success.set_text("Installed");
+                gnome_logout_after_success.set_visible(true);
+            }
+        });
+        let state_for_gnome_logout = Rc::clone(&state);
+        gnome_logout.connect_clicked(move |_| {
+            match Command::new("gnome-session-quit").arg("--logout").spawn() {
+                Ok(_) => state_for_gnome_logout
+                    .borrow()
+                    .status
+                    .set_text("GNOME is asking to log out; confirm there to activate parallax."),
+                Err(error) => state_for_gnome_logout
+                    .borrow()
+                    .status
+                    .set_text(&format!("Could not start GNOME logout: {error}")),
+            }
         });
         let state_for_provider = Rc::clone(&state);
         let api_key_for_visibility = api_key.clone();
@@ -1730,7 +1839,10 @@ fn model_index(model: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{cached_svg_path, preview_layer_from_selection, preview_pointer};
+    use super::{
+        DesktopEnvironment, cached_svg_path, desktop_environment, preview_layer_from_selection,
+        preview_pointer,
+    };
     use std::path::Path;
 
     #[test]
@@ -1753,5 +1865,19 @@ mod tests {
             cached_svg_path(Path::new("/tmp/out"), "discord.desktop"),
             Path::new("/tmp/out/apps/discord/icon.svg")
         );
+    }
+
+    #[test]
+    fn desktop_environment_uses_xdg_desktop_names() {
+        assert_eq!(
+            desktop_environment(Some("ubuntu:GNOME")),
+            DesktopEnvironment::Gnome
+        );
+        assert_eq!(desktop_environment(Some("KDE")), DesktopEnvironment::Kde);
+        assert_eq!(
+            desktop_environment(Some("Hyprland")),
+            DesktopEnvironment::Hyprland
+        );
+        assert_eq!(desktop_environment(None), DesktopEnvironment::Other);
     }
 }

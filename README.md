@@ -234,11 +234,14 @@ the panel, dock or unrelated applications.
 ./scripts/install-gnome-parallax.sh
 ```
 
-The GUI’s **Install GNOME parallax (admin)** button uses Polkit (`pkexec`),
-asks for your administrator password, and installs the extension system-wide
-under `/usr/share/gnome-shell/extensions`. The command above remains a
-password-free per-user install. To request the same system scope from a
-terminal, use `./scripts/install-gnome-parallax.sh --system`.
+The GUI detects `XDG_CURRENT_DESKTOP`: it shows the GNOME install action only
+inside a GNOME session, while inactive desktop rows say they are not in use.
+After a successful install the action becomes **Log out to activate**; GNOME
+still asks for confirmation before ending the session. The installer uses
+Polkit (`pkexec`), asks for your administrator password, and installs the
+extension system-wide under `/usr/share/gnome-shell/extensions`. The command
+above remains a password-free per-user install. To request the same system
+scope from a terminal, use `./scripts/install-gnome-parallax.sh --system`.
 
 KDE Plasma and Hyprland are detected by the installer and deliberately keep
 the installed icons static. GNOME Shell runs extension code in the Shell
