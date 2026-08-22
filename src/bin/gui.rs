@@ -584,30 +584,59 @@ impl IconApp {
     }
 
     fn reapply_cached(&mut self) {
-        self.repair_cached();
-        let indexes = self
-            .tasks
-            .iter()
-            .enumerate()
-            .filter_map(|(index, task)| {
-                (self.visible(index)
-                    && matches!(
-                        task.state,
-                        DesktopTaskState::Converted | DesktopTaskState::Completed
-                    ))
-                .then_some(index)
-            })
-            .collect::<Vec<_>>();
+        let ids = match self.installer.managed_ids() {
+            Ok(ids) => ids,
+            Err(error) => {
+                self.status
+                    .set_text(&format!("Managed icon state unreadable: {error}"));
+                return;
+            }
+        };
+        let settings = self.render_settings();
+        let mut applied = 0;
         let mut failed = 0;
-        for index in indexes {
-            if let Err(error) = self.apply_icon(index) {
-                failed += 1;
-                self.tasks[index].message = format!("cached apply failed: {error}");
+        for desktop_id in ids {
+            let svg_path = self
+                .output
+                .join(application_output_name(&desktop_id))
+                .join("icon.svg");
+            let result = fs::read_to_string(svg_path)
+                .map_err(|error| error.to_string())
+                .and_then(|svg| {
+                    self.installer
+                        .repair_cached_svg(&desktop_id, &svg, &mut self.glass, settings)
+                        .map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(()) => {
+                    applied += 1;
+                    if let Some(index) = self
+                        .applications
+                        .iter()
+                        .position(|application| application.id == desktop_id)
+                    {
+                        self.tasks[index].message = "global material applied".to_owned();
+                    }
+                }
+                Err(error) => {
+                    failed += 1;
+                    if let Some(index) = self
+                        .applications
+                        .iter()
+                        .position(|application| application.id == desktop_id)
+                    {
+                        self.tasks[index].message = format!("cached apply failed: {error}");
+                    }
+                }
             }
         }
-        if failed > 0 {
-            self.status
-                .set_text(&format!("{failed} cached icon(s) could not be applied"));
+        if let Some(index) = self.selected {
+            self.load_preview(index, true);
+        }
+        if applied > 0 || failed > 0 {
+            self.status.set_text(&format!(
+                "Global material: {applied} applied, {failed} need attention"
+            ));
             self.list_dirty = true;
         }
     }
