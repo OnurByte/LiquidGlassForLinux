@@ -809,10 +809,7 @@ impl IconApp {
         let mut applied = 0;
         let mut failed = 0;
         for desktop_id in ids {
-            let svg_path = self
-                .output
-                .join(application_output_name(&desktop_id))
-                .join("icon.svg");
+            let svg_path = cached_svg_path(&self.output, &desktop_id);
             let result = fs::read_to_string(svg_path)
                 .map_err(|error| error.to_string())
                 .and_then(|svg| {
@@ -877,10 +874,7 @@ impl IconApp {
             ) {
                 continue;
             }
-            let svg_path = self
-                .output
-                .join(application_output_name(&desktop_id))
-                .join("icon.svg");
+            let svg_path = cached_svg_path(&self.output, &desktop_id);
             let result = fs::read_to_string(svg_path)
                 .map_err(|error| error.to_string())
                 .and_then(|svg| {
@@ -1643,6 +1637,13 @@ fn app_output(output: &Path, application: &DesktopApplication) -> PathBuf {
         .join(application_output_name(&application.id))
 }
 
+fn cached_svg_path(output: &Path, desktop_id: &str) -> PathBuf {
+    output
+        .join("apps")
+        .join(application_output_name(desktop_id))
+        .join("icon.svg")
+}
+
 fn config_path() -> PathBuf {
     std::env::var_os("XDG_CONFIG_HOME")
         .map(PathBuf::from)
@@ -1723,7 +1724,8 @@ fn model_index(model: &str) -> u32 {
 
 #[cfg(test)]
 mod tests {
-    use super::{preview_layer_from_selection, preview_pointer};
+    use super::{cached_svg_path, preview_layer_from_selection, preview_pointer};
+    use std::path::Path;
 
     #[test]
     fn composite_selection_has_no_layer() {
@@ -1737,5 +1739,13 @@ mod tests {
         assert_eq!(preview_pointer(50.0, 50.0, 100, 100), [0.0, 0.0]);
         assert_eq!(preview_pointer(0.0, 100.0, 100, 100), [-1.0, 1.0]);
         assert_eq!(preview_pointer(300.0, -20.0, 100, 100), [1.0, -1.0]);
+    }
+
+    #[test]
+    fn cached_svg_path_matches_the_conversion_cache_layout() {
+        assert_eq!(
+            cached_svg_path(Path::new("/tmp/out"), "discord.desktop"),
+            Path::new("/tmp/out/apps/discord/icon.svg")
+        );
     }
 }
