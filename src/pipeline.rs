@@ -6,7 +6,7 @@ use crate::{
     normalize::normalize_to_png,
     openai::SvgProvider,
     prompt::PROMPT_VERSION,
-    svg::{validate_svg, validate_svg_structure},
+    svg::{validate_icon_document, validate_svg, validate_svg_structure},
 };
 use std::{
     collections::HashSet,
@@ -22,6 +22,8 @@ use std::{
 pub enum CacheStatus {
     Missing,
     Current,
+    /// Readable v2/v3 artwork; keep it until the user explicitly reconverts.
+    Legacy,
     Stale,
 }
 
@@ -43,6 +45,7 @@ pub async fn transform_icon(
     let svg = provider
         .generate_svg(&normalized_input, Arc::clone(&cancelled))
         .await?;
+    let document = validate_icon_document(&svg)?;
     let layers = validate_svg(&svg)?;
     if cancelled.load(Ordering::Relaxed) {
         return Err(IconError::Cancelled);
@@ -62,6 +65,7 @@ pub async fn transform_icon(
         },
         svg: "icon.svg".to_owned(),
         layers: layers.clone(),
+        document: Some(document),
         generator: GeneratorManifest {
             provider: provider.provider_name().to_owned(),
             model: provider.model(),
@@ -90,10 +94,12 @@ pub fn cache_status(output_dir: &Path, source_bytes: &[u8]) -> CacheStatus {
     if validate_svg_structure(&svg).is_err() {
         return CacheStatus::Missing;
     }
-    if manifest.source.sha256 == manifest::sha256(source_bytes) {
-        CacheStatus::Current
-    } else {
+    if manifest.source.sha256 != manifest::sha256(source_bytes) {
         CacheStatus::Stale
+    } else if manifest.schema_version < SCHEMA_VERSION {
+        CacheStatus::Legacy
+    } else {
+        CacheStatus::Current
     }
 }
 
@@ -123,6 +129,30 @@ pub async fn transform_desktop_icons_with_options<F>(
     provider: &SvgProvider,
     cancelled: Arc<AtomicBool>,
     force_ids: &HashSet<String>,
+    report: F,
+) -> Vec<TransformResult>
+where
+    F: FnMut(DesktopTaskEvent),
+{
+    transform_desktop_icons_with_options_and_assets(
+        applications,
+        output_dir,
+        provider,
+        cancelled,
+        force_ids,
+        None,
+        report,
+    )
+    .await
+}
+
+pub async fn transform_desktop_icons_with_options_and_assets<F>(
+    applications: &[DesktopApplication],
+    output_dir: &Path,
+    provider: &SvgProvider,
+    cancelled: Arc<AtomicBool>,
+    force_ids: &HashSet<String>,
+    asset_dir: Option<&Path>,
     mut report: F,
 ) -> Vec<TransformResult>
 where
@@ -176,6 +206,15 @@ where
                     ));
                     continue;
                 }
+                CacheStatus::Legacy => {
+                    report(event(
+                        application,
+                        DesktopTaskState::Converted,
+                        "legacy layout retained; reconvert to upgrade",
+                        None,
+                    ));
+                    continue;
+                }
                 CacheStatus::Stale => {
                     report(event(
                         application,
@@ -206,10 +245,19 @@ where
         .await;
         match result {
             Ok(result) => {
+                let archive_message = asset_dir.map(|asset_dir| {
+                    archive_conversion(asset_dir, application, &result)
+                        .map(|path| format!(" · archived {}", path.display()))
+                        .unwrap_or_else(|error| format!(" · archive skipped: {error}"))
+                });
                 report(event(
                     application,
                     DesktopTaskState::Completed,
-                    result.manifest_path.display().to_string(),
+                    format!(
+                        "{}{}",
+                        result.manifest_path.display(),
+                        archive_message.unwrap_or_default()
+                    ),
                     Some(result.clone()),
                 ));
                 results.push(result);
@@ -259,6 +307,45 @@ where
         }
     }
     results
+}
+
+/// Copy a valid local canonical source into the shareable asset collection.
+/// The archive contains no source raster or secret; only SVG and manifest.
+pub fn archive_conversion(
+    asset_dir: &Path,
+    application: &DesktopApplication,
+    result: &TransformResult,
+) -> Result<PathBuf, IconError> {
+    let source_dir = result
+        .svg_path
+        .parent()
+        .ok_or_else(|| IconError::Manifest("SVG path has no parent".to_owned()))?;
+    archive_cached_conversion(
+        asset_dir,
+        &application_output_name(&application.id),
+        source_dir,
+    )
+}
+
+pub fn archive_cached_conversion(
+    asset_dir: &Path,
+    name: &str,
+    source_dir: &Path,
+) -> Result<PathBuf, IconError> {
+    let svg = fs::read(source_dir.join("icon.svg"))?;
+    let svg_text =
+        std::str::from_utf8(&svg).map_err(|error| IconError::InvalidSvg(error.to_string()))?;
+    validate_svg_structure(svg_text)?;
+    let manifest = manifest::read_manifest(&source_dir.join("icon-manifest.json"))?;
+    if manifest.schema_version != SCHEMA_VERSION {
+        return Err(IconError::Manifest(format!(
+            "legacy schema v{} is not shareable; reconvert to v{} first",
+            manifest.schema_version, SCHEMA_VERSION
+        )));
+    }
+    let destination = asset_dir.join(name);
+    write_conversion_atomically(&destination, &svg, &manifest)?;
+    Ok(destination)
 }
 
 fn event(

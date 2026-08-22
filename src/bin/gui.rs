@@ -3,15 +3,16 @@ use adw::prelude::*;
 use adw::{Application, ApplicationWindow, Clamp, HeaderBar, ToolbarView};
 use libadwaita as adw;
 use liquid_glass_icon::{
-    AppCategory, Appearance,
+    AppCategory, Appearance, default_output_dir,
     desktop::{
         DesktopApplication, DesktopTaskEvent, DesktopTaskState, application_output_name,
         discover_desktop_applications,
     },
     icon_install::IconInstaller,
     openai::{CodexExecProvider, DEFAULT_MODEL, OpenAiResponsesClient, SvgProvider},
-    pipeline::{CacheStatus, cache_status, transform_desktop_icons_with_options},
+    pipeline::{CacheStatus, cache_status, transform_desktop_icons_with_options_and_assets},
     renderer::{GlassRenderer, RenderSettings, RenderTarget, apply_canonical_mask},
+    repository_assets_dir,
 };
 use serde::{Deserialize, Serialize};
 use std::{
@@ -30,6 +31,19 @@ use std::{
 
 const APPLICATION_ID: &str = "io.github.yargc.LiquidGlassIcons";
 const MODEL_OPTIONS: [&str; 4] = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.4"];
+
+fn preview_layer_from_selection(selected: u32) -> Option<usize> {
+    selected.checked_sub(1).map(|layer| layer as usize)
+}
+
+fn preview_pointer(x: f64, y: f64, width: i32, height: i32) -> [f32; 2] {
+    let width = f64::from(width.max(1));
+    let height = f64::from(height.max(1));
+    [
+        ((x / width - 0.5) * 2.0).clamp(-1.0, 1.0) as f32,
+        ((y / height - 0.5) * 2.0).clamp(-1.0, 1.0) as f32,
+    ]
+}
 
 fn main() {
     let application = Application::builder()
@@ -91,6 +105,10 @@ struct SavedSettings {
     #[serde(default = "default_accent")]
     accent: [u8; 3],
     #[serde(default)]
+    background: Option<[u8; 3]>,
+    #[serde(default = "default_tilt")]
+    tilt: bool,
+    #[serde(default)]
     blocked_categories: HashSet<AppCategory>,
 }
 
@@ -102,6 +120,8 @@ impl Default for SavedSettings {
             theme: ThemeChoice::System,
             appearance: Appearance::TintedLight,
             accent: default_accent(),
+            background: None,
+            tilt: true,
             blocked_categories: AppCategory::ALL
                 .into_iter()
                 .filter(|category| !category.enabled_by_default())
@@ -118,6 +138,8 @@ struct IconApp {
     theme: ThemeChoice,
     appearance: Appearance,
     accent: [u8; 3],
+    background: Option<[u8; 3]>,
+    tilt: bool,
     api_key: String,
     blocked_categories: HashSet<AppCategory>,
     output: PathBuf,
@@ -128,6 +150,7 @@ struct IconApp {
     preview_title: gtk::Label,
     preview_selector: gtk::DropDown,
     preview_layer: Option<usize>,
+    preview_pointer: [f32; 2],
     preview_selector_updating: Rc<Cell<bool>>,
     receiver: Option<Receiver<DesktopTaskEvent>>,
     cancelled: Arc<AtomicBool>,
@@ -154,7 +177,7 @@ impl IconApp {
             .collect();
         let style_manager = adw::StyleManager::default();
         style_manager.set_color_scheme(color_scheme(saved.theme));
-        Ok(Self {
+        let mut app = Self {
             applications,
             tasks,
             provider_choice: saved.provider,
@@ -162,6 +185,8 @@ impl IconApp {
             theme: saved.theme,
             appearance: saved.appearance,
             accent: saved.accent,
+            background: saved.background,
+            tilt: saved.tilt,
             api_key: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
             blocked_categories: saved.blocked_categories,
             output,
@@ -172,6 +197,7 @@ impl IconApp {
             preview_title: gtk::Label::new(Some("Preview")),
             preview_selector: gtk::DropDown::from_strings(&["Composite"]),
             preview_layer: None,
+            preview_pointer: [0.0, 0.0],
             preview_selector_updating: Rc::new(Cell::new(false)),
             receiver: None,
             cancelled: Arc::new(AtomicBool::new(false)),
@@ -180,7 +206,9 @@ impl IconApp {
             glass: renderer,
             installer: IconInstaller::default(),
             style_manager,
-        })
+        };
+        app.repair_cached();
+        Ok(app)
     }
 
     fn visible(&self, index: usize) -> bool {
@@ -193,8 +221,10 @@ impl IconApp {
         RenderSettings {
             appearance: self.appearance,
             accent: self.accent,
+            background: self.background,
             dark_background: self.style_manager.is_dark(),
             pointer: [0.0, 0.0],
+            tilt: false,
             layer: None,
         }
     }
@@ -254,13 +284,15 @@ impl IconApp {
     fn select(&mut self, index: usize) {
         self.selected = Some(index);
         self.preview_title.set_text(&self.applications[index].name);
-        if self.tasks[index].state == DesktopTaskState::Converted {
-            let _ = self.apply_icon(index);
+        if self.tasks[index].state == DesktopTaskState::Converted
+            && let Err(error) = self.apply_icon(index)
+        {
+            self.status.set_text(&format!("Apply failed: {error}"));
         }
-        self.load_preview(index);
+        self.load_preview(index, true);
     }
 
-    fn load_preview(&mut self, index: usize) {
+    fn load_preview(&mut self, index: usize, refresh_layers: bool) {
         let path = app_output(&self.output, &self.applications[index]).join("icon.svg");
         let result = fs::read_to_string(&path)
             .map_err(|error| error.to_string())
@@ -268,12 +300,27 @@ impl IconApp {
                 self.glass
                     .load_svg(&svg)
                     .map_err(|error| error.to_string())?;
-                self.set_preview_layers(self.glass.layer_count());
-                self.glass
-                    .render(520, 520, self.preview_settings(), RenderTarget::Preview)
-                    .map_err(|error| error.to_string())
+                if refresh_layers {
+                    let labels = self.glass.inspect_labels();
+                    self.set_preview_layers(&labels);
+                }
+                Ok(())
             });
         match result {
+            Ok(()) => self.render_preview(),
+            Err(error) => {
+                self.preview.set_paintable(Option::<&gdk::Paintable>::None);
+                self.status.set_text(&error);
+            }
+        }
+    }
+
+    fn render_preview(&mut self) {
+        match self
+            .glass
+            .render(520, 520, self.preview_settings(), RenderTarget::Preview)
+            .map_err(|error| error.to_string())
+        {
             Ok(mut image) => {
                 // The shader no longer masks output alpha; every preview view
                 // (composite and single layers) gets the one canonical mask.
@@ -294,24 +341,17 @@ impl IconApp {
         self.preview.set_paintable(Some(&texture));
     }
 
-    fn set_preview_layers(&mut self, layer_count: usize) {
+    fn set_preview_layers(&mut self, inspect_layers: &[String]) {
         let mut labels = vec!["Composite".to_owned()];
-        for layer in 0..layer_count {
-            labels.push(if layer == 0 {
-                "Background".to_owned()
-            } else {
-                format!("Layer {layer}")
-            });
-        }
+        labels.extend(inspect_layers.iter().cloned());
         let label_refs = labels.iter().map(String::as_str).collect::<Vec<_>>();
         let selected = self
             .preview_layer
-            .filter(|layer| *layer < layer_count)
+            .filter(|layer| *layer < inspect_layers.len())
             .map(|layer| layer + 1)
             .unwrap_or(0);
-        // then_some would evaluate `selected - 1` eagerly and underflow when
-        // Composite (0) is selected; the closure keeps it lazy.
-        self.preview_layer = (selected > 0).then(|| selected - 1);
+        // Composite (0) is not an icon layer.
+        self.preview_layer = preview_layer_from_selection(selected as u32);
         self.preview_selector_updating.set(true);
         self.preview_selector
             .set_model(Some(&gtk::StringList::new(&label_refs)));
@@ -320,15 +360,17 @@ impl IconApp {
     }
 
     fn set_preview_layer(&mut self, selected: u32) {
-        self.preview_layer = (selected > 0).then(|| selected as usize - 1);
-        if let Some(index) = self.selected {
-            self.load_preview(index);
+        self.preview_layer = preview_layer_from_selection(selected);
+        if self.selected.is_some() {
+            self.render_preview();
         }
     }
 
     fn preview_settings(&self) -> RenderSettings {
         let mut settings = self.render_settings();
         settings.layer = self.preview_layer;
+        settings.pointer = self.preview_pointer;
+        settings.tilt = self.tilt;
         settings
     }
 
@@ -391,6 +433,7 @@ impl IconApp {
         let output = self.output.clone();
         self.cancelled = Arc::new(AtomicBool::new(false));
         let cancelled = Arc::clone(&self.cancelled);
+        let asset_dir = repository_assets_dir();
         let (sender, receiver) = mpsc::channel();
         self.receiver = Some(receiver);
         self.status.set_text(&format!(
@@ -401,12 +444,13 @@ impl IconApp {
             let Ok(runtime) = tokio::runtime::Runtime::new() else {
                 return;
             };
-            runtime.block_on(transform_desktop_icons_with_options(
+            runtime.block_on(transform_desktop_icons_with_options_and_assets(
                 &applications,
                 &output,
                 &provider,
                 cancelled,
                 &force_ids,
+                asset_dir.as_deref(),
                 |event| {
                     let _ = sender.send(event);
                 },
@@ -494,7 +538,7 @@ impl IconApp {
             .apply_svg(&self.applications[index], &svg, &mut self.glass, settings)
             .map_err(|error| error.to_string())?;
         if self.selected == Some(index) {
-            self.load_preview(index);
+            self.load_preview(index, true);
         }
         Ok(())
     }
@@ -506,6 +550,8 @@ impl IconApp {
             theme: self.theme,
             appearance: self.appearance,
             accent: self.accent,
+            background: self.background,
+            tilt: self.tilt,
             blocked_categories: self.blocked_categories.clone(),
         };
         let path = config_path();
@@ -531,6 +577,7 @@ impl IconApp {
     }
 
     fn reapply_cached(&mut self) {
+        self.repair_cached();
         let indexes = self
             .tasks
             .iter()
@@ -544,8 +591,82 @@ impl IconApp {
                 .then_some(index)
             })
             .collect::<Vec<_>>();
+        let mut failed = 0;
         for index in indexes {
-            let _ = self.apply_icon(index);
+            if let Err(error) = self.apply_icon(index) {
+                failed += 1;
+                self.tasks[index].message = format!("cached apply failed: {error}");
+            }
+        }
+        if failed > 0 {
+            self.status
+                .set_text(&format!("{failed} cached icon(s) could not be applied"));
+            self.list_dirty = true;
+        }
+    }
+
+    fn repair_cached(&mut self) {
+        let ids = match self.installer.managed_ids() {
+            Ok(ids) => ids,
+            Err(error) => {
+                self.status
+                    .set_text(&format!("Managed icon state unreadable: {error}"));
+                return;
+            }
+        };
+        let mut repaired = 0;
+        let mut failed = 0;
+        for desktop_id in ids {
+            let Ok(Some(health)) = self.installer.health(&desktop_id) else {
+                failed += 1;
+                continue;
+            };
+            if !matches!(
+                health,
+                liquid_glass_icon::icon_install::ManagedIconHealth::Repairable
+            ) {
+                continue;
+            }
+            let svg_path = self
+                .output
+                .join(application_output_name(&desktop_id))
+                .join("icon.svg");
+            let settings = self.render_settings();
+            let result = fs::read_to_string(svg_path)
+                .map_err(|error| error.to_string())
+                .and_then(|svg| {
+                    self.installer
+                        .repair_cached_svg(&desktop_id, &svg, &mut self.glass, settings)
+                        .map_err(|error| error.to_string())
+                });
+            match result {
+                Ok(()) => {
+                    repaired += 1;
+                    if let Some(index) = self
+                        .applications
+                        .iter()
+                        .position(|application| application.id == desktop_id)
+                    {
+                        self.tasks[index].message = "auto-repaired from local cache".to_owned();
+                    }
+                }
+                Err(error) => {
+                    failed += 1;
+                    if let Some(index) = self
+                        .applications
+                        .iter()
+                        .position(|application| application.id == desktop_id)
+                    {
+                        self.tasks[index].message = format!("auto-repair needs attention: {error}");
+                    }
+                }
+            }
+        }
+        if repaired > 0 || failed > 0 {
+            self.status.set_text(&format!(
+                "Auto-repair: {repaired} repaired, {failed} need attention"
+            ));
+            self.list_dirty = true;
         }
     }
 }
@@ -671,12 +792,20 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
         "Tinted Light",
         "Tinted Dark",
     ]);
+    let tilt = gtk::Switch::new();
     let color_dialog = gtk::ColorDialog::new();
     color_dialog.set_with_alpha(false);
     let color = gtk::ColorDialogButton::new(Some(color_dialog));
     color.set_tooltip_text(Some(
         "Apple Tinted accent — only local renderer, never sent to AI",
     ));
+    let background_dialog = gtk::ColorDialog::new();
+    background_dialog.set_with_alpha(false);
+    let background_color = gtk::ColorDialogButton::new(Some(background_dialog));
+    background_color.set_tooltip_text(Some(
+        "Replace every icon background locally — never sent to AI",
+    ));
+    let reset_background = gtk::Button::with_label("Use source");
 
     {
         let app = state.borrow();
@@ -688,10 +817,18 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
         model.set_selected(model_index(&app.model));
         theme.set_selected(theme_index(app.theme));
         appearance.set_selected(appearance_index(app.appearance));
+        tilt.set_active(app.tilt);
         color.set_rgba(&gdk::RGBA::new(
             app.accent[0] as f32 / 255.0,
             app.accent[1] as f32 / 255.0,
             app.accent[2] as f32 / 255.0,
+            1.0,
+        ));
+        let background = app.background.unwrap_or([78, 94, 128]);
+        background_color.set_rgba(&gdk::RGBA::new(
+            background[0] as f32 / 255.0,
+            background[1] as f32 / 255.0,
+            background[2] as f32 / 255.0,
             1.0,
         ));
         api_key.set_visible(app.provider_choice == ProviderChoice::Api);
@@ -764,6 +901,11 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     settings_grid.attach(&appearance, 3, 0, 1, 1);
     settings_grid.attach(&field_label("Global accent"), 4, 0, 1, 1);
     settings_grid.attach(&color, 5, 0, 1, 1);
+    settings_grid.attach(&field_label("Global background"), 0, 1, 1, 1);
+    settings_grid.attach(&background_color, 1, 1, 1, 1);
+    settings_grid.attach(&reset_background, 2, 1, 1, 1);
+    settings_grid.attach(&field_label("3D tilt"), 4, 1, 1, 1);
+    settings_grid.attach(&tilt, 5, 1, 1, 1);
     settings.append(&settings_grid);
 
     let list_scroll = gtk::ScrolledWindow::builder()
@@ -782,7 +924,9 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     list_panel.append(&list_header);
     list_panel.append(&list_scroll);
 
-    let preview_caption = gtk::Label::new(Some("Runtime material preview · local WGPU renderer"));
+    let preview_caption = gtk::Label::new(Some(
+        "Runtime material preview · move the cursor to inspect layer depth",
+    ));
     preview_caption.add_css_class("section-caption");
     preview_caption.set_halign(gtk::Align::Start);
     let preview_heading = gtk::Box::new(gtk::Orientation::Vertical, 3);
@@ -798,6 +942,35 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     preview_surface.add_css_class("preview-surface");
     preview_surface.set_vexpand(true);
     preview_surface.append(&preview);
+    let motion = gtk::EventControllerMotion::new();
+    let state_for_motion = Rc::clone(&state);
+    let preview_surface_for_motion = preview_surface.clone();
+    motion.connect_motion(move |_, x, y| {
+        let Ok(mut app) = state_for_motion.try_borrow_mut() else {
+            return;
+        };
+        if app.selected.is_none() || !app.glass.has_preview() {
+            return;
+        }
+        app.preview_pointer = preview_pointer(
+            x,
+            y,
+            preview_surface_for_motion.width(),
+            preview_surface_for_motion.height(),
+        );
+        app.render_preview();
+    });
+    let state_for_motion_leave = Rc::clone(&state);
+    motion.connect_leave(move |_| {
+        let Ok(mut app) = state_for_motion_leave.try_borrow_mut() else {
+            return;
+        };
+        if app.preview_pointer != [0.0, 0.0] && app.selected.is_some() {
+            app.preview_pointer = [0.0, 0.0];
+            app.render_preview();
+        }
+    });
+    preview_surface.add_controller(motion);
     let right = gtk::Box::new(gtk::Orientation::Vertical, 14);
     right.add_css_class("card");
     right.set_hexpand(true);
@@ -891,9 +1064,9 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
             if preview_selector_updating.get() {
                 return;
             }
-            state_for_preview
-                .borrow_mut()
-                .set_preview_layer(dropdown.selected());
+            if let Ok(mut app) = state_for_preview.try_borrow_mut() {
+                app.set_preview_layer(dropdown.selected());
+            }
         });
         let state_for_theme = Rc::clone(&state);
         theme.connect_selected_notify(move |dropdown| {
@@ -923,6 +1096,34 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
             app.appearance = tinted_for(app.style_manager.is_dark());
             app.save();
             app.reapply_cached();
+        });
+        let state_for_background = Rc::clone(&state);
+        background_color.connect_rgba_notify(move |button| {
+            let rgba = button.rgba();
+            let mut app = state_for_background.borrow_mut();
+            app.background = Some([
+                (rgba.red() * 255.0) as u8,
+                (rgba.green() * 255.0) as u8,
+                (rgba.blue() * 255.0) as u8,
+            ]);
+            app.save();
+            app.reapply_cached();
+        });
+        let state_for_background_reset = Rc::clone(&state);
+        reset_background.connect_clicked(move |_| {
+            let mut app = state_for_background_reset.borrow_mut();
+            app.background = None;
+            app.save();
+            app.reapply_cached();
+        });
+        let state_for_tilt = Rc::clone(&state);
+        tilt.connect_active_notify(move |toggle| {
+            let mut app = state_for_tilt.borrow_mut();
+            app.tilt = toggle.is_active();
+            app.save();
+            if app.selected.is_some() {
+                app.render_preview();
+            }
         });
     }
 
@@ -980,6 +1181,10 @@ fn initial_task(application: &DesktopApplication, output: &Path) -> TaskRow {
             state: DesktopTaskState::Converted,
             message: "already converted".to_owned(),
         },
+        CacheStatus::Legacy => TaskRow {
+            state: DesktopTaskState::Converted,
+            message: "legacy layout; reconvert to upgrade".to_owned(),
+        },
         CacheStatus::Stale => TaskRow {
             state: DesktopTaskState::Stale,
             message: "source changed; reconvert manually".to_owned(),
@@ -991,14 +1196,6 @@ fn app_output(output: &Path, application: &DesktopApplication) -> PathBuf {
     output
         .join("apps")
         .join(application_output_name(&application.id))
-}
-
-fn default_output_dir() -> PathBuf {
-    let data_home = std::env::var_os("XDG_DATA_HOME")
-        .map(PathBuf::from)
-        .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")))
-        .unwrap_or_else(|| PathBuf::from("."));
-    data_home.join("liquid-glass-icon/out")
 }
 
 fn config_path() -> PathBuf {
@@ -1023,6 +1220,9 @@ fn default_appearance() -> Appearance {
 }
 fn default_accent() -> [u8; 3] {
     [137, 180, 250]
+}
+fn default_tilt() -> bool {
+    true
 }
 fn normalize_model(model: String) -> String {
     let model = model.trim();
@@ -1071,4 +1271,23 @@ fn model_index(model: &str) -> u32 {
         .iter()
         .position(|candidate| *candidate == model)
         .unwrap_or(0) as u32
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{preview_layer_from_selection, preview_pointer};
+
+    #[test]
+    fn composite_selection_has_no_layer() {
+        assert_eq!(preview_layer_from_selection(0), None);
+        assert_eq!(preview_layer_from_selection(1), Some(0));
+        assert_eq!(preview_layer_from_selection(5), Some(4));
+    }
+
+    #[test]
+    fn preview_pointer_is_normalized_and_clamped() {
+        assert_eq!(preview_pointer(50.0, 50.0, 100, 100), [0.0, 0.0]);
+        assert_eq!(preview_pointer(0.0, 100.0, 100, 100), [-1.0, 1.0]);
+        assert_eq!(preview_pointer(300.0, -20.0, 100, 100), [1.0, -1.0]);
+    }
 }

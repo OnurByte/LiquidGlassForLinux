@@ -1,0 +1,34 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <g id="background">
+    <rect x="0" y="0" width="1024" height="1024" fill="#000000"/>
+  </g>
+  <g id="group-1">
+    <g id="layer-1-1">
+      <circle cx="512" cy="512" r="487" fill="#f7f7f5"/>
+    </g>
+  </g>
+  <g id="group-2">
+    <g id="layer-2-1">
+      <circle cx="512" cy="512" r="432" fill="#403e4e"/>
+    </g>
+  </g>
+  <g id="group-3">
+    <g id="layer-3-1">
+      <path d="M512 504 L366 344" fill="none" stroke="#aaa9a2" stroke-width="28" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+    <g id="layer-3-2">
+      <path d="M512 504 L721 276" fill="none" stroke="#f7f7f5" stroke-width="13" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+    <g id="layer-3-3">
+      <path d="M512 526 L399 795" fill="none" stroke="#ff1f2a" stroke-width="10" stroke-linecap="round" stroke-linejoin="round"/>
+    </g>
+  </g>
+  <g id="group-4">
+    <g id="layer-4-1">
+      <circle cx="512" cy="505" r="50" fill="#e9e8df"/>
+    </g>
+    <g id="layer-4-2">
+      <circle cx="512" cy="505" r="18" fill="#071719"/>
+    </g>
+  </g>
+</svg>

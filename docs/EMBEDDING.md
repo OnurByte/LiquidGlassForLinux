@@ -16,16 +16,20 @@ let result = liquid_glass_icon::transform_icon(
 ).await?;
 ```
 
-`TransformResult` identifies the canonical SVG, v3 manifest, source hash and
-ordered layer IDs. Appearance and accent are intentionally absent from the
-conversion request and manifest.
+`TransformResult` identifies the canonical SVG, v4 manifest, source hash and
+ordered layer IDs. The v4 manifest additionally stores Icon Composer-style
+material groups, their child layers and Dark/Mono annotations. Appearance and
+accent are intentionally absent from the conversion request and manifest.
 
 ## Local rendering
 
-Use `svg::rasterize_layers` when a host needs the SVG groups as independent
-1024×1024 RGBA buffers. The bundled GUI passes those buffers to the WGPU
+Use `svg::rasterize_document` when a host needs the background, material groups
+and independent 1024×1024 RGBA child layers. `svg::rasterize_layers` remains
+for flat legacy callers. The bundled GUI passes the document to the WGPU
 renderer. `renderer::RenderSettings` contains runtime appearance, global tint
-and preview background; changing it does not invoke a provider.
+and optional global background override; changing it does not invoke a
+provider. `pointer` and `tilt` are preview-only: `RenderTarget::Icon` forces
+them to rest so installed assets are deterministic.
 
 ## Other languages
 

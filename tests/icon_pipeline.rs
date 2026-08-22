@@ -9,7 +9,10 @@ use liquid_glass_icon::{
     model::{Appearance, IconInput, TransformRequest},
     normalize::{has_transparency, normalize_to_png},
     openai::{CodexExecProvider, DEFAULT_MODEL, OpenAiResponsesClient, SvgProvider},
-    pipeline::{CacheStatus, cache_status, transform_desktop_icons_with_options, transform_icon},
+    pipeline::{
+        CacheStatus, archive_cached_conversion, cache_status, transform_desktop_icons_with_options,
+        transform_icon,
+    },
     prompt::SVG_PROMPT,
     renderer::appearance_index,
     svg::{rasterize_layers, validate_svg},
@@ -306,6 +309,35 @@ fn managed_desktop_override_keeps_original_icon_as_the_cache_source() {
     );
 }
 
+#[cfg(unix)]
+#[test]
+fn discovers_flatpak_style_symlinked_icons() {
+    use std::os::unix::fs::symlink;
+
+    let root = tempdir().unwrap();
+    let data_dir = root.path().join("share");
+    let applications_dir = data_dir.join("applications");
+    let export_dir = data_dir.join("icons/hicolor/scalable/apps");
+    let target = root.path().join("flatpak-app-export/demo.svg");
+    fs::create_dir_all(&applications_dir).unwrap();
+    fs::create_dir_all(&export_dir).unwrap();
+    fs::create_dir_all(target.parent().unwrap()).unwrap();
+    fs::write(&target, canonical_svg()).unwrap();
+    symlink(&target, export_dir.join("demo.svg")).unwrap();
+    fs::write(
+        applications_dir.join("demo.desktop"),
+        "[Desktop Entry]\nType=Application\nName=Demo\nIcon=demo\n",
+    )
+    .unwrap();
+
+    let applications = discover_desktop_applications_from_dirs(&[applications_dir], &[data_dir]);
+    assert_eq!(applications.len(), 1);
+    assert_eq!(
+        applications[0].icon_path.as_deref(),
+        Some(export_dir.join("demo.svg").as_path())
+    );
+}
+
 #[tokio::test]
 async fn responses_provider_uses_one_structured_request() {
     let server = MockServer::start_async().await;
@@ -329,7 +361,7 @@ async fn responses_provider_uses_one_structured_request() {
 }
 
 #[tokio::test]
-async fn conversion_writes_one_svg_and_v2_manifest() {
+async fn conversion_writes_one_svg_and_v4_manifest() {
     let server = MockServer::start_async().await;
     let mock = svg_mock(&server, &canonical_svg()).await;
     let provider = SvgProvider::Responses(
@@ -362,11 +394,49 @@ async fn conversion_writes_one_svg_and_v2_manifest() {
             .exists()
     );
     let manifest: serde_json::Value =
-        serde_json::from_slice(&fs::read(result.manifest_path).unwrap()).unwrap();
+        serde_json::from_slice(&fs::read(&result.manifest_path).unwrap()).unwrap();
     assert_eq!(manifest["schema_version"], SCHEMA_VERSION);
     assert_eq!(manifest["svg"], "icon.svg");
+    assert_eq!(
+        manifest["document"]["groups"].as_array().map(Vec::len),
+        Some(1)
+    );
     assert!(manifest.get("appearances").is_none());
     assert!(manifest["generator"].get("accent_color").is_none());
+
+    let archive = tempdir().unwrap();
+    let archived =
+        archive_cached_conversion(archive.path(), "demo", output.path().join("demo").as_path())
+            .unwrap();
+    assert_eq!(
+        fs::read(archived.join("icon.svg")).unwrap(),
+        fs::read(&result.svg_path).unwrap()
+    );
+    assert!(archived.join("icon-manifest.json").is_file());
+
+    let mut legacy = manifest;
+    legacy["schema_version"] = serde_json::json!(3);
+    legacy.as_object_mut().unwrap().remove("document");
+    fs::write(
+        &result.manifest_path,
+        serde_json::to_vec_pretty(&legacy).unwrap(),
+    )
+    .unwrap();
+    assert_eq!(
+        cache_status(
+            output.path().join("demo").as_path(),
+            &png_bytes([1, 2, 3, 255])
+        ),
+        CacheStatus::Legacy
+    );
+    assert!(
+        archive_cached_conversion(
+            archive.path(),
+            "legacy-demo",
+            output.path().join("demo").as_path(),
+        )
+        .is_err()
+    );
 }
 
 #[tokio::test]
@@ -403,7 +473,8 @@ async fn local_renderer_application_writes_real_linux_icon_sizes() {
         .unwrap()
         .to_owned();
     assert!(first_icon.starts_with("liquid-glass-demo-"));
-    for size in [128, 256, 512] {
+    assert!(data_home.join("icons/hicolor/index.theme").is_file());
+    for size in [16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024] {
         let path = data_home
             .join("icons/hicolor")
             .join(format!("{size}x{size}/apps/{first_icon}.png"));
@@ -428,12 +499,62 @@ async fn local_renderer_application_writes_real_linux_icon_sizes() {
         .find_map(|line| line.strip_prefix("Icon="))
         .unwrap();
     assert_ne!(first_icon, second_icon);
-    for size in [128, 256, 512] {
+    for size in [16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024] {
         let stale_path = data_home
             .join("icons/hicolor")
             .join(format!("{size}x{size}/apps/{first_icon}.png"));
         assert!(!stale_path.exists());
     }
+}
+
+#[tokio::test]
+async fn cached_repair_recovers_a_missing_launcher_and_empty_icon_file() {
+    let root = tempdir().unwrap();
+    let data_home = root.path().join("data");
+    let installer =
+        liquid_glass_icon::icon_install::IconInstaller::with_data_home_for_test(data_home.clone());
+    let application = application(root.path(), &png_bytes([12, 34, 56, 255]));
+    fs::write(
+        &application.desktop_file,
+        "[Desktop Entry]\nType=Application\nName=Demo\nIcon=demo\nCategories=Development;\n",
+    )
+    .unwrap();
+    let mut renderer = liquid_glass_icon::renderer::GlassRenderer::new()
+        .await
+        .unwrap();
+    let settings = liquid_glass_icon::renderer::RenderSettings {
+        appearance: Appearance::TintedLight,
+        ..Default::default()
+    };
+    installer
+        .apply_svg(&application, &canonical_svg(), &mut renderer, settings)
+        .unwrap();
+
+    let desktop_path = data_home.join("applications/demo.desktop");
+    let icon_name = fs::read_to_string(&desktop_path)
+        .unwrap()
+        .lines()
+        .find_map(|line| line.strip_prefix("Icon="))
+        .unwrap()
+        .to_owned();
+    let empty_path = data_home
+        .join("icons/hicolor/16x16/apps")
+        .join(format!("{icon_name}.png"));
+    RgbaImage::new(16, 16).save(&empty_path).unwrap();
+    fs::remove_file(&desktop_path).unwrap();
+    assert_eq!(
+        installer.health("demo.desktop").unwrap(),
+        Some(liquid_glass_icon::icon_install::ManagedIconHealth::Repairable)
+    );
+
+    installer
+        .repair_cached_svg("demo.desktop", &canonical_svg(), &mut renderer, settings)
+        .unwrap();
+    assert!(desktop_path.is_file());
+    assert_eq!(
+        installer.health("demo.desktop").unwrap(),
+        Some(liquid_glass_icon::icon_install::ManagedIconHealth::Healthy)
+    );
 }
 
 #[tokio::test]
@@ -675,60 +796,16 @@ fn combined_bounds(layers: &[liquid_glass_icon::svg::RasterLayer]) -> Option<(u3
     bounds
 }
 
-fn row_extent(layer: &liquid_glass_icon::svg::RasterLayer, y: u32) -> Option<(u32, u32)> {
-    let mut min_x = None;
-    let mut max_x = None;
-    for x in 0..layer.image.width() {
-        if layer.image.get_pixel(x, y)[3] > 128 {
-            min_x = Some(min_x.unwrap_or(x));
-            max_x = Some(x);
-        }
-    }
-    min_x.zip(max_x)
-}
-
-fn column_extent(layer: &liquid_glass_icon::svg::RasterLayer, x: u32) -> Option<(u32, u32)> {
-    let mut min_y = None;
-    let mut max_y = None;
-    for y in 0..layer.image.height() {
-        if layer.image.get_pixel(x, y)[3] > 128 {
-            min_y = Some(min_y.unwrap_or(y));
-            max_y = Some(y);
-        }
-    }
-    min_y.zip(max_y)
-}
-
 #[test]
-fn bridge_space_panels_fill_safe_zone_with_one_shared_transform() {
-    let fitted = liquid_glass_icon::renderer::prepare_canonical_layers(&four_group_svg()).unwrap();
-    assert_eq!(fitted.len(), 5);
-    let (min_x, min_y, max_x, max_y) = combined_bounds(&fitted).unwrap();
-    let width = max_x - min_x + 1;
-    let height = max_y - min_y + 1;
-    assert!((width as i32 - 860).abs() <= 6, "width {width}");
-    assert!((height as i32 - 860).abs() <= 6, "height {height}");
-    let center_x = f32::from((min_x + max_x + 1) as u16) / 2.0;
-    let center_y = f32::from((min_y + max_y + 1) as u16) / 2.0;
-    assert!((center_x - 512.0).abs() <= 4.0);
-    assert!((center_y - 512.0).abs() <= 4.0);
-
-    // Every panel keeps its own optical weight under the shared transform:
-    // the outer disc fills the band, the inner disc scales proportionally,
-    // and the thin bar stays thin instead of being fitted on its own.
-    let outer = row_extent(&fitted[1], 512).unwrap();
-    assert!(((outer.1 - outer.0 + 1) as i32 - 860).abs() <= 12);
-    let inner = row_extent(&fitted[2], 512).unwrap();
-    let inner_width = inner.1 - inner.0 + 1;
-    assert!(
-        (inner_width as i32 - 553).abs() <= 14,
-        "inner disc width {inner_width}"
-    );
-    let bar_height = {
-        let (top, bottom) = column_extent(&fitted[3], 512).unwrap();
-        bottom - top + 1
-    };
-    assert!(bar_height < 90, "bar grew to {bar_height}");
+fn bridge_space_panels_keep_their_canonical_grid_geometry() {
+    let source = rasterize_layers(&four_group_svg()).unwrap();
+    let prepared =
+        liquid_glass_icon::renderer::prepare_canonical_layers(&four_group_svg()).unwrap();
+    assert_eq!(prepared.len(), 5);
+    assert_eq!(prepared[1].image, source[1].image);
+    assert_eq!(prepared[2].image, source[2].image);
+    assert_eq!(prepared[3].image, source[3].image);
+    assert_eq!(combined_bounds(&prepared), combined_bounds(&source));
 }
 
 #[test]
@@ -769,29 +846,11 @@ fn athas_like_asymmetric_source_keeps_orientation_without_mirroring() {
     let (fitted_left, fitted_right, fitted_centroid_x) = side_mass(&fitted);
     let source_ratio = source_left as f64 / source_right.max(1) as f64;
     let fitted_ratio = fitted_left as f64 / fitted_right.max(1) as f64;
-    // Left-heavy artwork stays left-heavy: no mirroring, only recentering.
+    // Source-space positioning survives: no mirroring, centering, or scale.
     assert!(source_ratio > 1.5, "fixture should be asymmetric");
-    assert!(
-        (source_ratio - fitted_ratio).abs() / source_ratio <= 0.08,
-        "orientation changed: {source_ratio} -> {fitted_ratio}"
-    );
-    // The alpha centroid follows the shared transform exactly (it is not
-    // forced to 512 — only the combined bounding-box center is).
-    let source_bounds = combined_bounds(&source).unwrap();
-    let fitted_bounds = combined_bounds(&fitted).unwrap();
-    let source_span = (source_bounds.2 - source_bounds.0 + 1) as f64;
-    let scale = (fitted_bounds.2 - fitted_bounds.0 + 1) as f64 / source_span;
-    let mapped =
-        f64::from(fitted_bounds.0) + (source_centroid_x - f64::from(source_bounds.0)) * scale;
-    assert!(
-        (fitted_centroid_x - mapped).abs() <= 4.0,
-        "centroid drifted {fitted_centroid_x} vs {mapped}"
-    );
-    let fitted_center = (f64::from(fitted_bounds.0) + f64::from(fitted_bounds.2) + 1.0) / 2.0;
-    assert!(
-        (fitted_center - 512.0).abs() <= 2.0,
-        "bounds center {fitted_center}"
-    );
+    assert_eq!(source_ratio, fitted_ratio);
+    assert_eq!(source_centroid_x, fitted_centroid_x);
+    assert_eq!(combined_bounds(&source), combined_bounds(&fitted));
 }
 
 #[tokio::test]

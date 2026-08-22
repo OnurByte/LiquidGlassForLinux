@@ -4,9 +4,9 @@
   "title": "Liquid Glass canonical SVG manifest",
   "type": "object",
   "additionalProperties": false,
-  "required": ["schema_version", "source", "canvas", "svg", "layers", "generator"],
+  "required": ["schema_version", "source", "canvas", "svg", "layers", "document", "generator"],
   "properties": {
-    "schema_version": { "const": 3 },
+    "schema_version": { "const": 4 },
     "source": {
       "type": "object",
       "additionalProperties": false,
@@ -31,7 +31,7 @@
     "layers": {
       "type": "array",
       "minItems": 2,
-      "maxItems": 5,
+      "maxItems": 17,
       "prefixItems": [
         {
           "type": "object",
@@ -45,8 +45,68 @@
         "additionalProperties": false,
         "required": ["id", "z_index"],
         "properties": {
-          "id": { "pattern": "^foreground-[1-4]$" },
+          "id": { "pattern": "^(foreground-[1-4]|layer-[1-4]-[1-4])$" },
           "z_index": { "type": "integer", "minimum": 1, "maximum": 4 }
+        }
+      }
+    },
+    "document": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["background", "groups"],
+      "properties": {
+        "background": {
+          "type": "object",
+          "additionalProperties": false,
+          "required": ["id", "z_index"],
+          "properties": { "id": { "const": "background" }, "z_index": { "const": 0 } }
+        },
+        "groups": {
+          "type": "array",
+          "minItems": 1,
+          "maxItems": 4,
+          "items": {
+            "type": "object",
+            "additionalProperties": false,
+            "required": ["id", "z_index", "layers", "material", "dark", "mono"],
+            "properties": {
+              "id": { "pattern": "^(foreground-[1-4]|group-[1-4])$" },
+              "z_index": { "type": "integer", "minimum": 1, "maximum": 4 },
+              "layers": {
+                "type": "array",
+                "minItems": 1,
+                "maxItems": 4,
+                "items": {
+                  "type": "object",
+                  "additionalProperties": false,
+                  "required": ["id", "z_index"],
+                  "properties": {
+                    "id": { "type": "string", "minLength": 1 },
+                    "z_index": { "type": "integer", "minimum": 1, "maximum": 4 }
+                  }
+                }
+              },
+              "material": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": ["effects_enabled", "mode", "specular", "blur", "refraction", "translucency", "shadow"],
+                "properties": {
+                  "effects_enabled": { "type": "boolean" },
+                  "mode": { "enum": ["individual", "combined"] },
+                  "specular": { "enum": ["off", "automatic", "inside", "outside"] },
+                  "blur": { "type": "number", "minimum": 0, "maximum": 1 },
+                  "refraction": {
+                    "type": "array", "minItems": 2, "maxItems": 2,
+                    "items": { "type": "number", "minimum": 0, "maximum": 1 }
+                  },
+                  "translucency": { "type": "number", "minimum": 0, "maximum": 1 },
+                  "shadow": { "type": "number", "minimum": 0, "maximum": 1 }
+                }
+              },
+              "dark": { "$ref": "#/$defs/appearanceAnnotation" },
+              "mono": { "$ref": "#/$defs/appearanceAnnotation" }
+            }
+          }
         }
       }
     },
@@ -58,6 +118,17 @@
         "provider": { "enum": ["codex-exec", "responses-api"] },
         "model": { "type": "string", "minLength": 1 },
         "prompt_version": { "type": "integer", "minimum": 3 }
+      }
+    }
+  },
+  "$defs": {
+    "appearanceAnnotation": {
+      "type": "object",
+      "additionalProperties": false,
+      "required": ["opacity", "effects_enabled"],
+      "properties": {
+        "opacity": { "type": ["number", "null"], "minimum": 0, "maximum": 1 },
+        "effects_enabled": { "type": ["boolean", "null"] }
       }
     }
   }

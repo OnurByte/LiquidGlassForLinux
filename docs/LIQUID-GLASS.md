@@ -1,50 +1,45 @@
 # Liquid Glass icon contract
 
-The identity-bearing asset is one flat, layered SVG:
+The identity-bearing source is a 1024×1024 SVG document with one opaque canvas
+background and one to four material groups:
 
 ```text
-background -> foreground-1 -> [foreground-2] -> [foreground-3] -> [foreground-4]
+background -> group-1 -> [group-2] -> [group-3] -> [group-4]
+                   |             |
+             layer-1-1...  layer-2-1...
 ```
+
+Every group contains one to four direct child layers. The source IDs are
+`background`, `group-G` and `layer-G-L`; `G` and `L` are 1–4. Existing flat
+`foreground-1`…`foreground-4` SVGs remain readable and become one Individual
+group each, so cached icons do not require another provider call.
 
 Rules:
 
-- 1024×1024 SVG canvas and an opaque full-canvas background;
-- one opaque canvas background plus one to four independent foreground groups;
-- preserve the original brand, silhouette, proportions and meaningful detail;
-- vector paths/shapes only; text must be represented as paths;
-- no raster image, external reference, script, filter, blur, glow, bevel,
-  refraction or permanent shadow in source artwork;
-- no appearance variant or accent value in the canonical asset.
+- preserve the source 1024-grid position, orientation, proportions and brand
+  silhouette; clipping at the canvas edge is allowed, re-centering, mirroring,
+  safe-zone fitting and auto-enclosure extraction are not;
+- keep source vector-only: no image, external reference, script, text,
+  filter, mask, blur, glow, bevel, refraction or permanent shadow;
+- leave final canvas masking and dynamic material to the renderer; source
+  foreground groups must not contain a pre-made rounded-square canvas mask;
+- annotate a group with `data-liquid-mode="individual|combined"`, optional
+  `data-liquid-specular`, `data-liquid-effects`, blur/refraction/translucency/
+  shadow values, and optional Dark/Mono opacity/effect overrides;
+- never put accent, theme, Clear or Tinted values in the SVG or AI prompt.
 
-The local material renderer derives:
+`Individual` gives each child layer its own material surface. `Combined`
+composites a group’s child layers once, then gives that result one surface. The
+runtime supports effects on/off, `off|automatic|inside|outside` specular,
+normalized blur/refraction/translucency/shadow, plus default Dark and Mono
+annotations. The GUI exposes the resulting material surfaces in **Inspect**.
 
-```text
-Default
-Dark
-Mono -> Clear Light / Clear Dark
-Mono + user tint -> Tinted Light / Tinted Dark
-```
+Accent and appearance are local WGPU inputs; updating either only regenerates
+the Linux PNG outputs. The renderer applies a single centered final mask to
+the composite. It never modifies source artwork beforehand, so the same
+asymmetry and optical scale reach the installed icon.
 
-Tint is a global runtime uniform. It is not an application-specific AI
-instruction and does not cause regeneration. Before WGPU compositing the
-combined foreground alpha bounds follow Apple's safe-zone policy: artwork
-already inside the keep band (~791 px) keeps its source 1024-grid
-coordinates and is only translated so its combined center sits at (512,
-512); smaller artwork grows toward the ~84% (860 px) safe-zone target with
-one shared transform; overflowing artwork shrinks with that same transform.
-Layers are never scaled against their own bounding boxes, so relative layer
-geometry — a Discord face, BridgeSpace panels — stays intact without
-changing the canonical SVG. A full-bleed circle or rounded square in the
-first foreground slot is treated as an enclosure: its color field (gradients
-included) moves into the background layer instead of being flattened.
-Each foreground is composited at its normalized z position with a small static
-depth gap, z-weighted shadow/specular response and optional pointer parallax;
-the icon therefore retains layer separation even when motion is zero. The
-rounded-square mask has one canonical definition shared verbatim by the CPU
-path and the WGPU shader, centered exactly on (0.5, 0.5), and it is applied
-exactly once to the final image — never repeatedly to artwork layers.
-
-Apple's public Icon Composer model similarly separates flat layered artwork
-from dynamic system material. Apple's final `.icon` format and exact renderer
-remain platform-specific; this project's SVG/WGPU contract is an independent
-implementation of the observable model.
+This is an implementation of Apple’s *public* Icon Composer/HIG model.
+Apple’s private `.icon` asset internals, shader coefficients and exact corner
+curve are not public, so this project cannot honestly claim byte- or
+pixel-identical macOS output.

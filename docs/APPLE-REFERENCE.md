@@ -14,6 +14,14 @@ The important behavior for this project is:
 - avoid hard-coded static blur, shadow and glow in source artwork;
 - keep icons recognizable at smaller sizes.
 
+The public contract does **not** disclose Apple’s actual runtime shader,
+numeric material coefficients, private `.icon` representation or exact corner
+geometry. This repository therefore uses the public parts as hard rules
+(background, groups, flat source artwork, annotations and system-applied
+effects), and calls its WGPU output a compatible Linux implementation rather
+than a pixel-identical clone. Any claim beyond that needs direct Apple source
+or a reproducible comparison, neither of which is public documentation.
+
 References:
 
 - [Apple App Icons](https://developer.apple.com/design/human-interface-guidelines/app-icons/)

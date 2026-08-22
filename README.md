@@ -37,18 +37,22 @@ Clear, Tinted or preview motion never sends another AI request.
 - Optional Responses API provider with an in-memory, masked API-key field.
 - Default model: `gpt-5.6-luna`, with model selection in the GUI and CLI.
 - One conversion request per icon, cached by source hash and manifest version.
-- One 1024×1024 SVG: an opaque background plus one to four foreground layers.
-- Small AI geometry spills past the canvas are clipped during rasterization and
-  then fitted into the safe area automatically.
-- Local WGPU material pass with depth, layer separation, safe-area fitting,
+- One 1024×1024 source document: opaque background, one to four material
+  groups, and one to four independent layers inside each group.
+- Source coordinates, orientation and scale stay intact. Overflow is clipped
+  at the canvas edge; the renderer never recentres, mirrors or safe-zone-fits
+  a logo.
+- Local WGPU material pass with per-group Individual/Combined mode,
   refraction, shadows, specular response, Default/Dark/Clear/Tinted looks and
   one global accent.
-- Batch theme and accent controls. Accent is a renderer uniform, never prompt
-  text and never an app-specific AI setting.
+- Batch theme, accent and background controls. They are renderer uniforms,
+  never prompt text and never app-specific AI settings.
 - Daily-use categories enabled by default. Avahi/SSH server browsers,
   settings, system helpers and terminal entries stay out until you opt in.
-- User-scoped icon installation with `.desktop` overrides and a Restore action;
-  `/usr/share/applications` is not modified.
+- User-scoped icon installation with standard 16–1024 px Hicolor assets,
+  cache refresh and a fingerprinted `.desktop` override. The GNOME app grid
+  sees an override reinsertion without logout; `/usr/share/applications` is
+  not modified.
 - Explicit Stop, a 120-second Codex timeout and no AI work at application
   startup.
 
@@ -68,8 +72,8 @@ flowchart LR
     H --> F
     F --> I[Local WGPU renderer]
     T[System theme + global accent + appearance] --> I
-    I --> J[Preview / 128-512 px PNG]
-    J --> K[User .desktop override]
+    I --> J[Preview / standard 16-1024 px Hicolor PNGs]
+    J --> K[User .desktop override + cache refresh]
     K --> L[Restore original at any time]
 ```
 
@@ -82,19 +86,20 @@ than to a static blur filter:
 ```mermaid
 flowchart TD
     B[Background\nfull 1024 px canvas] --> R[Local material renderer]
-    L1[Foreground 1\nmain silhouette] --> R
-    L2[Foreground 2\nsecondary form] --> R
-    L3[Foreground 3\nsmall identity detail] --> R
-    L4[Foreground 4\noptional top detail] --> R
+    G1[Group 1\n1-4 source layers] --> R
+    G2[Group 2\n1-4 source layers] --> R
+    G3[Group 3\noptional] --> R
+    G4[Group 4\noptional] --> R
     R --> M[Depth gap + shadow + specular + refraction]
     M --> O[Default / Dark / Clear / Tinted]
     O --> A[One global accent]
 ```
 
-Every foreground layer is rasterized separately, fit into a centered safe
-area, and composited at a different normalized depth. That is why a triangular
-or wide icon does not get crushed into the rounded-square frame, and why an
-icon still has depth when the pointer is not moving.
+Each material group is either rendered per child layer (**Individual**) or
+flattened once before material (**Combined**). The renderer preserves the
+source 1024-grid exactly, keeps group ordering, and applies one centered final
+mask only after composition. That keeps an asymmetric logo asymmetric instead
+of silently mirroring or re-centring it.
 
 The canonical SVG deliberately contains no accent, appearance, blur, glow,
 refraction or permanent shadow. A single converted asset can therefore produce
@@ -114,9 +119,11 @@ stays focused on the app-icon asset and installation layer.
 | [Tahoe Style Icon Set](https://github.com/chris1111/IconSet-Tahoe-Style-Linux-Mac) | Prebuilt icon collection | Ready-made macOS Tahoe-inspired artwork for Linux, macOS and Windows | Static collection; no source-hash cache, category filter, provider boundary or reversible installer |
 | [decant](https://github.com/kylebshr/decant) | Apple `.icon` research and extraction | Useful reverse-engineering reference for Apple's layered material data | Works with Apple's private formats and Icon Composer; it is not a Linux desktop icon installer |
 
-The goal is not to pretend Linux is macOS. The goal is to bring the part that
-actually matters here—the layered source plus runtime material separation—to a
-native Linux workflow with clear boundaries and an escape hatch.
+The target is the public Icon Composer contract, not an invented static filter:
+flat source artwork, groups, appearance annotations and runtime material. Apple
+does not publish its private renderer coefficients or exact corner geometry, so
+pixel-perfect macOS parity is not claimed. The Linux renderer is deliberately
+testable and keeps those boundaries explicit.
 
 ## Install
 
@@ -141,6 +148,12 @@ For a quick development launch:
 cargo run --release --bin liquid-glass-icon-gui
 ```
 
+On NixOS or another Nix system:
+
+```bash
+nix run github:OnurByte/LiquidGlassForLinux
+```
+
 ## Providers and models
 
 ### Codex exec — the default
@@ -151,7 +164,8 @@ MCP hooks ignored. It receives one image, one strict output schema and one
 identity-preserving SVG prompt. It does not need API credit.
 
 ```bash
-cargo run --release -- --provider codex --model gpt-5.6-luna --output out
+cargo run --release -- convert --desktop-id org.example.App.desktop \
+  --provider codex --model gpt-5.6-luna
 ```
 
 ### Responses API — optional
@@ -161,7 +175,8 @@ the CLI:
 
 ```bash
 OPENAI_API_KEY='...' \
-  cargo run --release -- --provider api --model gpt-5.6-luna --output out
+  cargo run --release -- convert --desktop-id org.example.App.desktop \
+    --provider api --model gpt-5.6-luna
 ```
 
 The GUI masks the key and keeps it in memory. It is not written to settings,
@@ -170,20 +185,29 @@ manifests, logs or command-line arguments.
 ## CLI shortcuts
 
 ```bash
-# Convert visible, daily-use app categories.
-cargo run --release -- --provider codex --output out
+# Discover exact desktop IDs.
+cargo run --release -- discover --json
 
-# Include system, settings, terminal and other utility entries deliberately.
-cargo run --release -- --all-categories --output out
+# Inspect cache and managed state.
+cargo run --release -- status --desktop-id org.gnome.Calculator.desktop --json
 
-# Reconvert one app only; normal runs reuse a current cache.
-cargo run --release -- --reconvert org.gnome.Calculator.desktop --output out
+# Convert one app only after an explicit request.
+cargo run --release -- convert \
+  --desktop-id org.gnome.Calculator.desktop --provider codex --json
 
 # Apply current cached SVGs without calling Codex or the API.
-cargo run --release -- --apply-cache --output out
+cargo run --release -- apply \
+  --desktop-id org.gnome.Calculator.desktop --appearance tinted-light \
+  --background 263447 --json
+
+# Repair missing/empty managed icons from their local SVG cache only.
+cargo run --release -- repair --managed --json
+
+# Put every local canonical SVG + manifest into assets/icons for sharing.
+cargo run --release -- archive --json
 
 # Restore a managed launcher and original icon.
-cargo run --release -- --restore org.gnome.Calculator.desktop
+cargo run --release -- restore --desktop-id org.gnome.Calculator.desktop --json
 ```
 
 Generated data looks like this:
@@ -205,6 +229,16 @@ out/apps/org.gnome.Calculator/
 - Codex conversion fails after 120 seconds instead of hanging forever.
 - Application icons are installed only in user data with user `.desktop`
   overrides. Original launchers remain available through **Restore**.
+- Icon discovery follows normal XDG icon directories and Flatpak export
+  symlinks, so sandboxed applications use their real exported source artwork.
+- Preview supports pointer parallax and an optional **3D tilt** card response.
+  These are preview-only; installed Hicolor PNGs always render at rest.
+- New conversions from this checkout are copied atomically into
+  [`assets/icons`](assets/icons/README.md) with their manifests. Use
+  `LIQUID_GLASS_ASSET_DIR` to target another collection.
+- On launch, the GUI repairs missing overrides, wrong-size files and fully
+  transparent generated PNGs from the local canonical SVG. It never calls AI
+  for repair and refuses to overwrite a launcher the user changed.
 - Server browsers, settings, system utilities and terminals are classified and
   excluded by default, rather than wasting requests on everything discovered
   in `/usr/share/applications`.

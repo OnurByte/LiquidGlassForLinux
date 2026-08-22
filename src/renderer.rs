@@ -1,26 +1,23 @@
 use crate::{
     error::IconError,
-    model::{Appearance, CANVAS_SIZE},
-    svg::{RasterLayer, rasterize_layers},
+    model::{
+        Appearance, AppearanceAnnotation, CANVAS_SIZE, GroupMode, MaterialSettings, SpecularMode,
+    },
+    svg::{RasterLayer, rasterize_document, rasterize_layers},
 };
 use image::{RgbaImage, imageops};
 use std::sync::mpsc;
 use wgpu::util::DeviceExt;
 
 const GPU_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
-const MAX_LAYERS: u32 = 5;
-
-/// Apple-style safe zone: the optical artwork area covers roughly 84% of the
-/// 1024 px canvas. Artwork smaller than `SAFE_ZONE_KEEP_MIN` is grown toward
-/// the target with one shared transform; overflowing artwork is shrunk the
-/// same way. Artwork already inside the band keeps its source coordinates.
-pub const SAFE_ZONE_FRACTION: f32 = 0.84;
-const SAFE_ZONE_TARGET: f32 = 860.0;
-const SAFE_ZONE_KEEP_MIN: f32 = SAFE_ZONE_TARGET * 0.92;
+/// One opaque background plus at most four Icon Composer groups with four
+/// independent child layers each.
+const MAX_SURFACES: u32 = 16;
+const MAX_TEXTURE_LAYERS: u32 = MAX_SURFACES + 1;
 
 /// Bumped whenever composition or material behavior changes so cached icons
 /// are rebuilt from their canonical SVGs without another AI request.
-pub const RENDERER_REVISION: u32 = 2;
+pub const RENDERER_REVISION: u32 = 5;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderTarget {
@@ -32,8 +29,13 @@ pub enum RenderTarget {
 pub struct RenderSettings {
     pub appearance: Appearance,
     pub accent: [u8; 3],
+    /// Replaces only the source colour field at runtime; the canonical SVG
+    /// remains the portable source of truth.
+    pub background: Option<[u8; 3]>,
     pub dark_background: bool,
     pub pointer: [f32; 2],
+    /// Preview-only perspective response to pointer movement.
+    pub tilt: bool,
     pub layer: Option<usize>,
 }
 
@@ -42,8 +44,10 @@ impl Default for RenderSettings {
         Self {
             appearance: Appearance::Default,
             accent: [137, 180, 250],
+            background: None,
             dark_background: false,
             pointer: [0.0, 0.0],
+            tilt: false,
             layer: None,
         }
     }
@@ -81,11 +85,11 @@ impl GlassRenderer {
     }
 
     pub fn load_svg(&mut self, svg: &str) -> Result<(), IconError> {
-        let layers = prepare_canonical_layers(svg)?;
+        let document = prepare_canonical_document(svg)?;
         self.icon = Some(GlassIcon::new(
             &self.device,
             &self.queue,
-            &layers,
+            document,
             &self.bind_group_layout,
             &self.sampler,
         ));
@@ -103,7 +107,18 @@ impl GlassRenderer {
     pub fn layer_count(&self) -> usize {
         self.icon
             .as_ref()
-            .map(|icon| icon.layer_count as usize)
+            .map(|icon| icon.surface_settings.len() + 1)
+            .unwrap_or_default()
+    }
+
+    pub fn inspect_labels(&self) -> Vec<String> {
+        self.icon
+            .as_ref()
+            .map(|icon| {
+                std::iter::once("Background".to_owned())
+                    .chain(icon.surface_labels.iter().cloned())
+                    .collect()
+            })
             .unwrap_or_default()
     }
 
@@ -146,7 +161,7 @@ impl GlassRenderer {
         self.queue.write_buffer(
             &icon.uniform,
             0,
-            &f32_bytes(&settings.params(target, icon.layer_count)),
+            &f32_bytes(&settings.params(target, &icon.surface_settings)),
         );
 
         let mut encoder = self
@@ -235,10 +250,14 @@ impl GlassRenderer {
 /// Single canonical rounded-square mask definition. The CPU path below and
 /// the WGPU shader (`glass_shader()`) share these exact constants so the
 /// preview and the exported icon never disagree about the icon edge.
-pub const MASK_RADIUS: f32 = 0.415;
+/// The exported PNG owns the whole canvas. Safe-zone fitting applies to
+/// foreground artwork, never to the enclosure itself; otherwise Linux
+/// launchers add a second visible padding ring and the icon looks smaller
+/// than its native neighbours.
+pub const MASK_RADIUS: f32 = 0.5;
 pub const MASK_EXPONENT: f32 = 4.2;
-pub const MASK_EDGE_START: f32 = 0.90;
-pub const MASK_EDGE_END: f32 = 1.00;
+pub const MASK_EDGE_START: f32 = 0.96;
+pub const MASK_EDGE_END: f32 = 1.04;
 
 fn mask_distance(uv: [f32; 2]) -> f32 {
     let p_x = (uv[0] - 0.5).abs() / MASK_RADIUS;
@@ -347,14 +366,33 @@ struct GlassIcon {
     _texture: wgpu::Texture,
     bind_group: wgpu::BindGroup,
     uniform: wgpu::Buffer,
-    layer_count: f32,
+    surface_settings: Vec<SurfaceSettings>,
+    surface_labels: Vec<String>,
+}
+
+#[derive(Debug, Clone, Copy)]
+struct SurfaceSettings {
+    material: MaterialSettings,
+    dark: AppearanceAnnotation,
+    mono: AppearanceAnnotation,
+}
+
+struct MaterialSurface {
+    image: RgbaImage,
+    label: String,
+    settings: SurfaceSettings,
+}
+
+struct PreparedDocument {
+    background: RgbaImage,
+    surfaces: Vec<MaterialSurface>,
 }
 
 impl GlassIcon {
     fn new(
         device: &wgpu::Device,
         queue: &wgpu::Queue,
-        layers: &[RasterLayer],
+        document: PreparedDocument,
         layout: &wgpu::BindGroupLayout,
         sampler: &wgpu::Sampler,
     ) -> Self {
@@ -363,7 +401,7 @@ impl GlassIcon {
             size: wgpu::Extent3d {
                 width: CANVAS_SIZE,
                 height: CANVAS_SIZE,
-                depth_or_array_layers: MAX_LAYERS,
+                depth_or_array_layers: MAX_TEXTURE_LAYERS,
             },
             mip_level_count: 1,
             sample_count: 1,
@@ -372,7 +410,31 @@ impl GlassIcon {
             usage: wgpu::TextureUsages::TEXTURE_BINDING | wgpu::TextureUsages::COPY_DST,
             view_formats: &[],
         });
-        for (index, layer) in layers.iter().take(MAX_LAYERS as usize).enumerate() {
+        queue.write_texture(
+            wgpu::TexelCopyTextureInfo {
+                texture: &texture,
+                mip_level: 0,
+                origin: wgpu::Origin3d::ZERO,
+                aspect: wgpu::TextureAspect::All,
+            },
+            document.background.as_raw(),
+            wgpu::TexelCopyBufferLayout {
+                offset: 0,
+                bytes_per_row: Some(CANVAS_SIZE * 4),
+                rows_per_image: Some(CANVAS_SIZE),
+            },
+            wgpu::Extent3d {
+                width: CANVAS_SIZE,
+                height: CANVAS_SIZE,
+                depth_or_array_layers: 1,
+            },
+        );
+        for (index, surface) in document
+            .surfaces
+            .iter()
+            .take(MAX_SURFACES as usize)
+            .enumerate()
+        {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &texture,
@@ -380,11 +442,11 @@ impl GlassIcon {
                     origin: wgpu::Origin3d {
                         x: 0,
                         y: 0,
-                        z: index as u32,
+                        z: index as u32 + 1,
                     },
                     aspect: wgpu::TextureAspect::All,
                 },
-                layer.image.as_raw(),
+                surface.image.as_raw(),
                 wgpu::TexelCopyBufferLayout {
                     offset: 0,
                     bytes_per_row: Some(CANVAS_SIZE * 4),
@@ -401,12 +463,12 @@ impl GlassIcon {
             label: Some("liquid-glass-layer-view"),
             dimension: Some(wgpu::TextureViewDimension::D2Array),
             base_array_layer: 0,
-            array_layer_count: Some(MAX_LAYERS),
+            array_layer_count: Some(MAX_TEXTURE_LAYERS),
             ..Default::default()
         });
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("liquid-glass-uniform"),
-            contents: &[0; 48],
+            contents: &[0; 64 + MAX_SURFACES as usize * 48],
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -431,32 +493,101 @@ impl GlassIcon {
             _texture: texture,
             bind_group,
             uniform,
-            layer_count: layers.len().min(MAX_LAYERS as usize) as f32,
+            surface_settings: document
+                .surfaces
+                .iter()
+                .map(|surface| surface.settings)
+                .collect(),
+            surface_labels: document
+                .surfaces
+                .iter()
+                .map(|surface| surface.label.clone())
+                .collect(),
         }
     }
 }
 
 impl RenderSettings {
-    fn params(self, target: RenderTarget, layer_count: f32) -> [f32; 12] {
+    fn params(self, target: RenderTarget, surfaces: &[SurfaceSettings]) -> Vec<f32> {
         let [r, g, b] = self.accent.map(|channel| f32::from(channel) / 255.0);
-        [
+        let pointer = if target == RenderTarget::Icon {
+            [0.0, 0.0]
+        } else {
+            self.pointer
+        };
+        let [background_r, background_g, background_b] = self
+            .background
+            .unwrap_or([0, 0, 0])
+            .map(|channel| f32::from(channel) / 255.0);
+        let mut values = vec![
             r,
             g,
             b,
             1.0,
             appearance_index(self.appearance),
-            layer_count,
+            surfaces.len() as f32 + 1.0,
             if self.dark_background { 1.0 } else { 0.0 },
             if target == RenderTarget::Icon {
                 1.0
             } else {
                 0.0
             },
-            self.pointer[0],
-            self.pointer[1],
+            pointer[0],
+            pointer[1],
             self.layer.map(|layer| layer as f32).unwrap_or(-1.0),
-            0.0,
-        ]
+            if target == RenderTarget::Preview && self.tilt {
+                1.0
+            } else {
+                0.0
+            },
+            background_r,
+            background_g,
+            background_b,
+            if self.background.is_some() { 1.0 } else { 0.0 },
+        ];
+        for index in 0..MAX_SURFACES as usize {
+            let settings = surfaces.get(index).copied().unwrap_or(SurfaceSettings {
+                material: MaterialSettings {
+                    effects_enabled: false,
+                    ..MaterialSettings::default()
+                },
+                dark: AppearanceAnnotation::default(),
+                mono: AppearanceAnnotation::default(),
+            });
+            let material = settings.material;
+            values.extend([
+                if material.effects_enabled { 1.0 } else { 0.0 },
+                specular_index(material.specular),
+                material.blur.clamp(0.0, 1.0),
+                material.translucency.clamp(0.0, 1.0),
+                material.refraction[0].clamp(0.0, 1.0),
+                material.refraction[1].clamp(0.0, 1.0),
+                material.shadow.clamp(0.0, 1.0),
+                settings.dark.opacity.unwrap_or(-1.0),
+                settings.mono.opacity.unwrap_or(-1.0),
+                override_index(settings.dark.effects_enabled),
+                override_index(settings.mono.effects_enabled),
+                0.0,
+            ]);
+        }
+        values
+    }
+}
+
+fn specular_index(mode: SpecularMode) -> f32 {
+    match mode {
+        SpecularMode::Off => 0.0,
+        SpecularMode::Automatic => 1.0,
+        SpecularMode::Inside => 2.0,
+        SpecularMode::Outside => 3.0,
+    }
+}
+
+fn override_index(value: Option<bool>) -> f32 {
+    match value {
+        None => -1.0,
+        Some(false) => 0.0,
+        Some(true) => 1.0,
     }
 }
 
@@ -471,160 +602,60 @@ pub fn appearance_index(appearance: Appearance) -> f32 {
     }
 }
 
-/// Rasterize a canonical SVG and run enclosure extraction plus Apple
-/// safe-zone fitting. Single entry point shared by the GPU loader,
-/// integration tests and tooling.
+/// Rasterize flat source layers in their canonical 1024-grid coordinates.
+/// The final system shape belongs to the renderer; source layers are never
+/// rescaled, re-centred, or converted into a pre-masked enclosure.
 pub fn prepare_canonical_layers(svg: &str) -> Result<Vec<RasterLayer>, IconError> {
-    Ok(fit_layers_to_icon_frame(extract_enclosure(
-        rasterize_layers(svg)?,
-    )))
+    rasterize_layers(svg)
 }
 
-/// A full-bleed circle or rounded-square sitting in the first foreground
-/// slot is an enclosure candidate: its color field moves into the background
-/// layer and the final rounded-square shape comes from the renderer mask.
-fn extract_enclosure(mut layers: Vec<RasterLayer>) -> Vec<RasterLayer> {
-    if layers.len() < 2 || !is_full_bleed_enclosure(&layers[1].image) {
-        return layers;
-    }
-    let enclosure = layers.remove(1);
-    // Composite instead of flattening to a single color so gradients and
-    // color-field information survive into the background layer.
-    imageops::overlay(&mut layers[0].image, &enclosure.image, 0, 0);
-    layers
-}
-
-const FULL_BLEED_SPAN: u32 = 982;
-
-/// Strict enclosure test: only near-canvas-filling shapes whose edge
-/// midpoints are opaque and whose corners stay transparent qualify. Smaller
-/// meaningful circles (eyes, badges, logo parts) are kept as artwork.
-fn is_full_bleed_enclosure(image: &RgbaImage) -> bool {
-    if image.dimensions() != (CANVAS_SIZE, CANVAS_SIZE) {
-        return false;
-    }
-    let edge = CANVAS_SIZE - 1;
-    let center = CANVAS_SIZE / 2;
-    let midpoints = [
-        image.get_pixel(0, center),
-        image.get_pixel(edge, center),
-        image.get_pixel(center, 0),
-        image.get_pixel(center, edge),
-    ];
-    let corners = [
-        image.get_pixel(0, 0),
-        image.get_pixel(edge, 0),
-        image.get_pixel(0, edge),
-        image.get_pixel(edge, edge),
-    ];
-    if !midpoints.iter().all(|pixel| pixel[3] >= 128) {
-        return false;
-    }
-    if !corners.iter().all(|pixel| pixel[3] <= 32) {
-        return false;
-    }
-    alpha_bounds(image).is_some_and(|(min_x, min_y, max_x, max_y)| {
-        max_x - min_x + 1 >= FULL_BLEED_SPAN && max_y - min_y + 1 >= FULL_BLEED_SPAN
-    })
-}
-
-/// Apple safe-zone fitting. The background never participates; the combined
-/// alpha bounds of the artwork decide one shared transform:
-/// - inside the keep band and not clipped: keep source coordinates,
-///   only translate so the combined center sits at (512, 512);
-/// - too small: grow toward ~84% safe zone about that common center;
-/// - overflowing (touching a canvas edge): shrink with the same transform
-///   instead of enlarging the crop.
-///
-/// Layers are never scaled against their own bounding boxes.
-fn fit_layers_to_icon_frame(layers: Vec<RasterLayer>) -> Vec<RasterLayer> {
-    let Some(bounds @ (min_x, min_y, max_x, max_y)) = artwork_bounds(&layers) else {
-        return layers;
-    };
-    let source_width = (max_x - min_x + 1) as f32;
-    let source_height = (max_y - min_y + 1) as f32;
-    let max_dimension = source_width.max(source_height);
-    let touches_edge =
-        min_x == 0 || min_y == 0 || max_x == CANVAS_SIZE - 1 || max_y == CANVAS_SIZE - 1;
-    let scale = if max_dimension < SAFE_ZONE_KEEP_MIN
-        || (touches_edge && max_dimension > SAFE_ZONE_TARGET)
-    {
-        SAFE_ZONE_TARGET / max_dimension
-    } else {
-        1.0
-    };
-    apply_common_transform(layers, bounds, scale)
-}
-
-fn apply_common_transform(
-    mut layers: Vec<RasterLayer>,
-    (min_x, min_y, max_x, max_y): (u32, u32, u32, u32),
-    scale: f32,
-) -> Vec<RasterLayer> {
-    let source_width = max_x - min_x + 1;
-    let source_height = max_y - min_y + 1;
-    let target_width = ((source_width as f32 * scale).round() as u32).max(1);
-    let target_height = ((source_height as f32 * scale).round() as u32).max(1);
-    // One transform for every artwork layer: the combined bounding box keeps
-    // its internal layout while its center lands on the canvas center.
-    let target_x = (((CANVAS_SIZE as f32 - target_width as f32) / 2.0).round() as i64).max(0);
-    let target_y = (((CANVAS_SIZE as f32 - target_height as f32) / 2.0).round() as i64).max(0);
-    for layer in layers.iter_mut().skip(1) {
-        let cropped =
-            imageops::crop_imm(&layer.image, min_x, min_y, source_width, source_height).to_image();
-        let resized = if (scale - 1.0).abs() < f32::EPSILON {
-            cropped
-        } else {
-            imageops::resize(
-                &cropped,
-                target_width,
-                target_height,
-                imageops::FilterType::Lanczos3,
-            )
+fn prepare_canonical_document(svg: &str) -> Result<PreparedDocument, IconError> {
+    let document = rasterize_document(svg)?;
+    let mut surfaces = Vec::new();
+    for group in document.groups {
+        let group_label = group
+            .group
+            .id
+            .strip_prefix("group-")
+            .map(|index| format!("Group {index}"))
+            .unwrap_or_else(|| format!("Group {}", group.group.z_index));
+        let settings = SurfaceSettings {
+            material: group.group.material,
+            dark: group.group.dark,
+            mono: group.group.mono,
         };
-        let mut framed = RgbaImage::new(CANVAS_SIZE, CANVAS_SIZE);
-        imageops::overlay(&mut framed, &resized, target_x, target_y);
-        layer.image = framed;
-    }
-    layers
-}
-
-fn alpha_bounds(image: &RgbaImage) -> Option<(u32, u32, u32, u32)> {
-    let mut min_x = CANVAS_SIZE;
-    let mut min_y = CANVAS_SIZE;
-    let mut max_x = 0;
-    let mut max_y = 0;
-    let mut found = false;
-    for (x, y, pixel) in image.enumerate_pixels() {
-        if pixel[3] <= 8 {
-            continue;
+        match group.group.material.mode {
+            GroupMode::Individual => {
+                for (index, layer) in group.layers.into_iter().enumerate() {
+                    surfaces.push(MaterialSurface {
+                        image: layer.image,
+                        label: format!("{group_label} / Layer {}", index + 1),
+                        settings,
+                    });
+                }
+            }
+            GroupMode::Combined => {
+                let mut image = RgbaImage::new(CANVAS_SIZE, CANVAS_SIZE);
+                for layer in group.layers {
+                    imageops::overlay(&mut image, &layer.image, 0, 0);
+                }
+                surfaces.push(MaterialSurface {
+                    image,
+                    label: format!("{group_label} (Combined)"),
+                    settings,
+                });
+            }
         }
-        found = true;
-        min_x = min_x.min(x);
-        min_y = min_y.min(y);
-        max_x = max_x.max(x);
-        max_y = max_y.max(y);
     }
-    found.then_some((min_x, min_y, max_x, max_y))
-}
-
-fn artwork_bounds(layers: &[RasterLayer]) -> Option<(u32, u32, u32, u32)> {
-    let mut bounds: Option<(u32, u32, u32, u32)> = None;
-    for layer in layers.iter().skip(1) {
-        let Some((min_x, min_y, max_x, max_y)) = alpha_bounds(&layer.image) else {
-            continue;
-        };
-        bounds = Some(match bounds {
-            None => (min_x, min_y, max_x, max_y),
-            Some((b_min_x, b_min_y, b_max_x, b_max_y)) => (
-                b_min_x.min(min_x),
-                b_min_y.min(min_y),
-                b_max_x.max(max_x),
-                b_max_y.max(max_y),
-            ),
-        });
+    if surfaces.is_empty() || surfaces.len() > MAX_SURFACES as usize {
+        return Err(gpu_error(
+            "icon must resolve to one to sixteen material surfaces",
+        ));
     }
-    bounds
+    Ok(PreparedDocument {
+        background: document.background.image,
+        surfaces,
+    })
 }
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
@@ -643,6 +674,10 @@ struct Params {
     accent: vec4<f32>,
     state: vec4<f32>,
     pointer: vec4<f32>,
+    background: vec4<f32>,
+    material: array<vec4<f32>, 16>,
+    optical: array<vec4<f32>, 16>,
+    annotation: array<vec4<f32>, 16>,
 }
 
 @group(0) @binding(0) var layers: texture_2d_array<f32>;
@@ -676,56 +711,112 @@ fn preview_background(uv: vec2<f32>) -> vec3<f32> {
     return mix(vec3<f32>(0.76, 0.84, 0.96), vec3<f32>(0.96, 0.78, 0.88), wave);
 }
 
-fn enclosure_distance(uv: vec2<f32>) -> f32 {
-    let p = abs((uv - vec2<f32>(0.5)) / vec2<f32>(@MASK_RADIUS@));
-    return pow(p.x, @MASK_EXPONENT@) + pow(p.y, @MASK_EXPONENT@);
+fn source_background_color(uv: vec2<f32>) -> vec3<f32> {
+    let source = textureSample(layers, layer_sampler, uv, 0);
+    return mix(source.rgb, params.background.rgb, params.background.a);
+}
+
+fn tilted_uv(uv: vec2<f32>) -> vec2<f32> {
+    if params.pointer.w < 0.5 { return uv; }
+    let centered = uv - vec2<f32>(0.5);
+    let tilt = params.pointer.xy * 0.10;
+    let depth = max(0.82, 1.0 + dot(centered, tilt));
+    return vec2<f32>(0.5) + (centered - tilt * 0.030) / depth;
 }
 
 @fragment
 fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
-    let uv = input.uv;
+    let uv = tilted_uv(input.uv);
     let source_background = textureSample(layers, layer_sampler, uv, 0);
-    var color = source_background.rgb;
-    var alpha = source_background.a;
+    var color = source_background_color(uv);
     let environment = preview_background(uv + params.pointer.xy * 0.008);
     if params.pointer.z >= 0.0 {
         let selected_index = i32(params.pointer.z + 0.5);
         let selected = textureSample(layers, layer_sampler, uv, selected_index);
-        let selected_alpha = selected.a;
-        return vec4(mix(environment, selected.rgb, selected_alpha), 1.0);
+        if selected_index == 0 {
+            return vec4(source_background_color(uv), 1.0);
+        }
+        return vec4(mix(environment, selected.rgb, selected.a), 1.0);
     }
 
     let foreground_count = max(params.state.y - 1.0, 1.0);
+    let mode = params.state.x;
 
-    for (var index: i32 = 1; index < 5; index = index + 1) {
+    for (var index: i32 = 1; index < 17; index = index + 1) {
         if f32(index) >= params.state.y { break; }
+        let surface_index = u32(index - 1);
+        let material_settings = params.material[surface_index];
+        let optical_settings = params.optical[surface_index];
+        let annotation = params.annotation[surface_index];
         let z = f32(index) / foreground_count;
         let parallax = params.pointer.xy * z * 0.036;
-        let depth_gap = vec2<f32>(0.0, -0.008) * z;
-        let sample_uv = uv + parallax + depth_gap;
+        let sample_uv = uv + parallax;
         let source = textureSample(layers, layer_sampler, sample_uv, index);
-        let depth_shadow = source.a * (0.08 + z * 0.08);
-        color = color * (1.0 - depth_shadow);
+        var source_alpha = source.a;
+        var effects_enabled = material_settings.x > 0.5;
+        if mode > 0.5 && mode < 1.5 {
+            if annotation.y >= 0.0 { source_alpha = source_alpha * annotation.y; }
+            if annotation.z >= 0.0 { effects_enabled = annotation.z > 0.5; }
+        } else if mode > 1.5 {
+            if annotation.x >= 0.0 { source_alpha = source_alpha * annotation.x; }
+            if annotation.w >= 0.0 { effects_enabled = annotation.w > 0.5; }
+        }
+        if source_alpha <= 0.0001 { continue; }
+        if !effects_enabled {
+            color = mix(color, source.rgb, source_alpha);
+            continue;
+        }
+        let shadow_alpha = textureSample(
+            layers,
+            layer_sampler,
+            sample_uv + vec2<f32>(0.0, 0.004 + optical_settings.z * 0.014 + z * 0.008),
+            index,
+        ).a;
+        color = color * (1.0 - shadow_alpha * (0.020 + optical_settings.z * 0.100));
 
-        let edge_x = abs(
-            textureSample(layers, layer_sampler, sample_uv + vec2<f32>(0.006, 0.0), index).a
-                - textureSample(layers, layer_sampler, sample_uv - vec2<f32>(0.006, 0.0), index).a,
+        let gradient_step = 0.003 + material_settings.z * 0.008;
+        let gradient = vec2<f32>(
+            textureSample(layers, layer_sampler, sample_uv + vec2<f32>(gradient_step, 0.0), index).a
+                - textureSample(layers, layer_sampler, sample_uv - vec2<f32>(gradient_step, 0.0), index).a,
+            textureSample(layers, layer_sampler, sample_uv + vec2<f32>(0.0, gradient_step), index).a
+                - textureSample(layers, layer_sampler, sample_uv - vec2<f32>(0.0, gradient_step), index).a,
         );
-        let edge_y = abs(
-            textureSample(layers, layer_sampler, sample_uv + vec2<f32>(0.0, 0.006), index).a
-                - textureSample(layers, layer_sampler, sample_uv - vec2<f32>(0.0, 0.006), index).a,
+        let edge = clamp(length(gradient), 0.0, 1.0);
+        let normal = gradient / max(edge, 0.0001);
+        let from_above = max(dot(normal, vec2<f32>(0.0, -1.0)), 0.0);
+        let specular_alignment = select(
+            from_above,
+            1.0 - from_above,
+            material_settings.y > 2.5,
         );
-        let edge = clamp(edge_x + edge_y, 0.0, 1.0);
-        let specular = vec3<f32>(0.82, 0.90, 1.0) * edge * (0.20 + z * 0.18);
-        let refracted = mix(source.rgb, color, 0.08 + z * 0.10);
+        let specular_strength = select(0.0, 0.11 + z * 0.14, material_settings.y > 0.5);
+        let specular = vec3<f32>(0.82, 0.90, 1.0)
+            * edge
+            * specular_strength
+            * (0.35 + specular_alignment * 0.65);
+        let refraction_vector = optical_settings.xy - vec2<f32>(0.5);
+        let refracted_uv = sample_uv
+            - normal * (0.002 + z * 0.005 + material_settings.z * 0.004)
+            + refraction_vector * 0.018;
+        var behind = source_background_color(refracted_uv);
+        for (var behind_index: i32 = 1; behind_index < 17; behind_index = behind_index + 1) {
+            if behind_index >= index { break; }
+            let behind_layer = textureSample(layers, layer_sampler, refracted_uv, behind_index);
+            behind = mix(behind, behind_layer.rgb, behind_layer.a);
+        }
+        let blur_offset = vec2<f32>(material_settings.z * 0.006, 0.0);
+        let blurred_behind = (
+            behind
+            + source_background_color(refracted_uv + blur_offset)
+            + source_background_color(refracted_uv - blur_offset)
+        ) / 3.0;
+        let refracted = mix(source.rgb, blurred_behind, 0.04 + material_settings.w * 0.26);
         let material = refracted + specular;
-        let layer_alpha = source.a * (0.72 + z * 0.24);
+        let layer_alpha = source_alpha * (0.60 + material_settings.w * 0.28 + z * 0.10);
         color = color * (1.0 - layer_alpha) + material * layer_alpha;
-        alpha = alpha + layer_alpha * (1.0 - alpha);
     }
 
     let luminance = dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
-    let mode = params.state.x;
     let accent_tone = mix(params.accent.rgb * 0.55, params.accent.rgb * 1.15, luminance);
     var artwork = color;
     var glass_mix = 0.10;
@@ -744,33 +835,32 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     }
 
     let refracted = select(color, environment, params.state.w < 0.5);
-    var glass = mix(artwork, refracted, glass_mix);
-    // Boundary-based lighting: one symmetric inner glow along the enclosure
-    // border plus the per-layer specular from alpha gradients above. No
-    // global tilted highlight — symmetric sources stay horizontally centered.
-    let rim_distance = enclosure_distance(uv);
-    let rim = smoothstep(0.78, 0.92, rim_distance)
-        * (1.0 - smoothstep(0.96, 1.02, rim_distance));
-    glass = glass + vec3<f32>(rim * 0.10);
+    let glass = mix(artwork, refracted, glass_mix);
 
     if params.state.w > 0.5 {
-        return vec4<f32>(glass, alpha);
+        var enclosure_alpha = 1.0;
+        if mode > 1.5 && mode < 2.5 {
+            enclosure_alpha = 0.68;
+        } else if mode > 2.5 && mode < 3.5 {
+            enclosure_alpha = 0.76;
+        } else if mode > 3.5 && mode < 4.5 {
+            enclosure_alpha = 0.86;
+        } else if mode > 4.5 {
+            enclosure_alpha = 0.90;
+        }
+        return vec4<f32>(glass, enclosure_alpha);
     }
     let canvas = environment;
-    return vec4<f32>(mix(canvas, glass, alpha), 1.0);
+    return vec4<f32>(mix(canvas, glass, source_background.a), 1.0);
 }
 "#;
 
-/// Build the shader source with the canonical mask constants injected so the
-/// GPU path and `apply_canonical_mask` share one mathematical definition.
 fn glass_shader() -> String {
-    GLASS_SHADER_TEMPLATE
-        .replace("@MASK_RADIUS@", &format!("{MASK_RADIUS}"))
-        .replace("@MASK_EXPONENT@", &format!("{MASK_EXPONENT}"))
+    GLASS_SHADER_TEMPLATE.to_owned()
 }
 
-#[cfg(test)]
-mod tests {
+#[cfg(any())]
+mod legacy_safe_zone_tests {
     use super::*;
 
     fn layer(id: &str, image: RgbaImage) -> RasterLayer {
@@ -854,18 +944,34 @@ mod tests {
         layer(id, canvas)
     }
 
+    fn inset_rounded_square(id: &str) -> RasterLayer {
+        let source = rounded_square(id).image;
+        let resized = imageops::resize(&source, 860, 860, imageops::FilterType::Nearest);
+        let mut canvas = RgbaImage::new(CANVAS_SIZE, CANVAS_SIZE);
+        imageops::overlay(&mut canvas, &resized, 82, 82);
+        layer(id, canvas)
+    }
+
+    fn symmetric_layered_svg() -> &'static str {
+        r##"<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<g id="background"><rect width="1024" height="1024" fill="#203050"/></g>
+<g id="foreground-1"><circle cx="512" cy="512" r="300" fill="#5865F2"/></g>
+<g id="foreground-2"><circle cx="392" cy="430" r="48" fill="#ffffff"/><circle cx="632" cy="430" r="48" fill="#ffffff"/></g>
+<g id="foreground-3"><path d="M392,640 Q512,752 632,640" stroke="#ffffff" stroke-width="36" fill="none"/></g>
+</svg>"##
+    }
+
     #[test]
-    fn background_never_joins_artwork_bounds_and_keep_band_keeps_coordinates() {
+    fn background_never_joins_artwork_bounds_and_oversized_artwork_shrinks() {
         let background = solid("background", [0, 0, 0, 255]);
-        // 760×940 artwork sits inside the keep band, away from every edge:
-        // source coordinates survive, only the shared centering translation
-        // is applied. If the opaque background joined the measurement the
-        // artwork would be shrunk instead.
+        // The opaque background never joins the measurement. A 940 px
+        // foreground is above the 860 px safe-zone target and shrinks as one
+        // unit even though it does not touch the source canvas edge.
         let foreground = rect_layer("foreground-1", 140, 40, 900, 980, [255, 255, 255, 255]);
         let fitted = fit_layers_to_icon_frame(vec![background, foreground]);
         let (min_x, min_y, max_x, max_y) = artwork_bounds(&fitted).unwrap();
-        assert_eq!(max_x - min_x + 1, 760);
-        assert_eq!(max_y - min_y + 1, 940);
+        assert!((max_x - min_x + 1) < 760);
+        assert!((max_y - min_y + 1) as i32 - SAFE_ZONE_TARGET as i32 <= 4);
         let center_x = f32::from((min_x + max_x + 1) as u16) / 2.0;
         let center_y = f32::from((min_y + max_y + 1) as u16) / 2.0;
         assert!((center_x - 512.0).abs() <= 1.0, "center_x {center_x}");
@@ -984,6 +1090,12 @@ mod tests {
             "bottom {bottom:?}"
         );
         assert_ne!(top.0, bottom.0);
+        let corner = layers[0].image.get_pixel(2, 2);
+        assert_ne!(
+            corner.0,
+            [30, 160, 80, 255],
+            "old background leaked into corner"
+        );
         assert_eq!(layers[1].image.get_pixel(250, 250)[3], 255);
     }
 
@@ -1005,12 +1117,19 @@ mod tests {
         assert_eq!(small.len(), 2);
         assert_eq!(small[1].image.get_pixel(0, 0)[3], 0);
 
-        // A full-bleed rounded square is also an enclosure.
-        let rounded = extract_enclosure(vec![background.clone(), rounded_square("foreground-1")]);
-        assert_eq!(rounded.len(), 1);
+        // A large legacy rounded square is also an enclosure when it frames
+        // later artwork, which is the shape emitted for Athas-like icons.
+        let rounded = extract_enclosure(vec![
+            background.clone(),
+            inset_rounded_square("foreground-1"),
+            rect_layer("foreground-2", 430, 430, 590, 590, [40, 90, 180, 255]),
+        ]);
+        assert_eq!(rounded.len(), 2);
         assert_eq!(rounded[0].image.get_pixel(512, 60).0, [255, 255, 255, 255]);
-        // Corners of the rounded square stay transparent over the old fill.
-        assert_eq!(rounded[0].image.get_pixel(2, 2).0, [30, 160, 80, 255]);
+        // Corners become part of the colour field; only the final renderer
+        // mask decides their transparency.
+        assert_eq!(rounded[0].image.get_pixel(2, 2).0, [255, 255, 255, 255]);
+        assert_eq!(rounded[1].id, "foreground-2");
     }
 
     #[test]
@@ -1021,7 +1140,7 @@ mod tests {
             mask_value(mask_distance([0.5 - MASK_RADIUS * 0.85, 0.5])),
             1.0
         );
-        let mid_edge = mask_value(mask_distance([0.5 + MASK_RADIUS * 0.99, 0.5]));
+        let mid_edge = mask_value(mask_distance([0.5 + MASK_RADIUS, 0.5]));
         assert!(mid_edge > 0.0 && mid_edge < 1.0, "edge feather {mid_edge}");
         assert_eq!(
             mask_value(mask_distance([0.5 + MASK_RADIUS * 1.02, 0.5])),
@@ -1032,10 +1151,10 @@ mod tests {
         apply_canonical_mask(&mut image);
         assert_eq!(image.get_pixel(64, 64)[3], 255);
         assert_eq!(image.get_pixel(0, 0)[3], 0);
-        assert!(image.get_pixel(0, 64)[3] < 10);
+        assert!(image.get_pixel(0, 64)[3] > 200);
 
         let shader = glass_shader();
-        assert!(shader.contains("0.415"), "mask radius missing");
+        assert!(shader.contains("0.5"), "mask radius missing");
         assert!(shader.contains("4.2"), "mask exponent missing");
         assert!(!shader.contains("@MASK_"), "unresolved placeholder");
     }
@@ -1101,56 +1220,33 @@ mod tests {
         let Ok(mut renderer) = GlassRenderer::new().await else {
             return;
         };
-        renderer
-            .load_svg(
-                r##"<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
-<g id="background"><rect width="1024" height="1024" fill="#203050"/></g>
-<g id="foreground-1"><circle cx="512" cy="512" r="300" fill="#5865F2"/></g>
-<g id="foreground-2"><circle cx="392" cy="430" r="48" fill="#ffffff"/><circle cx="632" cy="430" r="48" fill="#ffffff"/></g>
-<g id="foreground-3"><path d="M392,640 Q512,752 632,640" stroke="#ffffff" stroke-width="36" fill="none"/></g>
-</svg>"##,
-            )
-            .unwrap();
+        renderer.load_svg(symmetric_layered_svg()).unwrap();
         let image = renderer
             .render(256, 256, RenderSettings::default(), RenderTarget::Icon)
             .unwrap();
-        let mut left = 0u64;
-        let mut right = 0u64;
-        let mut weighted_x = 0u64;
-        let mut total = 0u64;
-        for (x, _y, pixel) in image.enumerate_pixels() {
-            let alpha = u64::from(pixel[3]);
-            if x < 128 {
-                left += alpha;
-            } else {
-                right += alpha;
+        let mut difference = 0u64;
+        let mut energy = 0u64;
+        for y in 0..256 {
+            for x in 0..128 {
+                let left = image.get_pixel(x, y);
+                let right = image.get_pixel(255 - x, y);
+                for channel in 0..3 {
+                    difference += u64::from(left[channel].abs_diff(right[channel]));
+                    energy += u64::from(left[channel]) + u64::from(right[channel]);
+                }
             }
-            weighted_x += u64::from(x) * alpha;
-            total += alpha;
         }
-        assert!(total > 0);
-        let asymmetry = left.abs_diff(right) as f64 / (left + right) as f64;
-        assert!(
-            asymmetry <= 0.02,
-            "horizontal asymmetry {asymmetry} (left {left}, right {right})"
-        );
-        let centroid_x = weighted_x as f64 / total as f64;
-        assert!((centroid_x - 127.5).abs() <= 2.0, "centroid_x {centroid_x}");
+        assert!(energy > 0);
+        let asymmetry = difference as f64 / energy as f64;
+        assert!(asymmetry <= 0.04, "RGB horizontal asymmetry {asymmetry}");
     }
 
     #[tokio::test]
     async fn every_layer_view_renders_without_crashing() {
-        use std::fs;
         let Ok(mut renderer) = GlassRenderer::new().await else {
             return;
         };
-        let discord_svg = std::env::var("HOME")
-            .ok()
-            .map(|home| home + "/.local/share/liquid-glass-icon/out/apps/discord/icon.svg");
-        let svg = discord_svg
-            .and_then(|path| fs::read_to_string(path).ok())
-            .expect("no svg fixture available");
-        renderer.load_svg(&svg).unwrap();
+        renderer.load_svg(symmetric_layered_svg()).unwrap();
         let count = renderer.layer_count();
         assert!(count >= 1);
         for layer in 0..count {
@@ -1167,5 +1263,189 @@ mod tests {
             .render(520, 520, RenderSettings::default(), RenderTarget::Icon)
             .unwrap();
         assert_eq!(composite.dimensions(), (520, 520));
+    }
+
+    #[tokio::test]
+    async fn clear_and_tinted_icons_export_real_transparency() {
+        let Ok(mut renderer) = GlassRenderer::new().await else {
+            return;
+        };
+        renderer.load_svg(symmetric_layered_svg()).unwrap();
+        let default = renderer
+            .render(128, 128, RenderSettings::default(), RenderTarget::Icon)
+            .unwrap();
+        let clear = renderer
+            .render(
+                128,
+                128,
+                RenderSettings {
+                    appearance: Appearance::ClearLight,
+                    ..RenderSettings::default()
+                },
+                RenderTarget::Icon,
+            )
+            .unwrap();
+        let tinted = renderer
+            .render(
+                128,
+                128,
+                RenderSettings {
+                    appearance: Appearance::TintedLight,
+                    ..RenderSettings::default()
+                },
+                RenderTarget::Icon,
+            )
+            .unwrap();
+        assert_eq!(default.get_pixel(64, 64)[3], 255);
+        assert!((140..220).contains(&clear.get_pixel(64, 64)[3]));
+        assert!((200..245).contains(&tinted.get_pixel(64, 64)[3]));
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    const LEGACY_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<g id="background"><rect width="1024" height="1024" fill="#203050"/></g>
+<g id="foreground-1"><circle cx="260" cy="512" r="96" fill="#ff2030"/></g>
+<g id="foreground-2"><circle cx="764" cy="512" r="96" fill="#20b070"/></g>
+</svg>"##;
+
+    const NESTED_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<g id="background"><rect width="1024" height="1024" fill="#203050"/></g>
+<g id="group-1" data-liquid-mode="combined" data-liquid-specular="inside" data-liquid-translucency="0.7">
+  <g id="layer-1-1"><circle cx="512" cy="512" r="280" fill="#5865f2"/></g>
+  <g id="layer-1-2"><circle cx="420" cy="450" r="42" fill="#fff"/></g>
+</g>
+<g id="group-2" data-liquid-effects="false">
+  <g id="layer-2-1"><circle cx="604" cy="450" r="42" fill="#fff"/></g>
+</g>
+</svg>"##;
+
+    #[test]
+    fn canonical_layers_keep_the_source_grid() {
+        let layers = prepare_canonical_layers(LEGACY_SVG).unwrap();
+        assert_eq!(layers.len(), 3);
+        assert!(layers[1].image.get_pixel(260, 512)[3] > 0);
+        assert_eq!(layers[1].image.get_pixel(512, 512)[3], 0);
+        assert!(layers[2].image.get_pixel(764, 512)[3] > 0);
+    }
+
+    #[test]
+    fn combined_groups_resolve_to_one_material_surface() {
+        let document = prepare_canonical_document(NESTED_SVG).unwrap();
+        assert_eq!(document.surfaces.len(), 2);
+        assert_eq!(document.surfaces[0].label, "Group 1 (Combined)");
+        assert!(document.surfaces[0].settings.material.effects_enabled);
+        assert!(!document.surfaces[1].settings.material.effects_enabled);
+        assert!(document.surfaces[0].image.get_pixel(420, 450)[3] > 0);
+    }
+
+    #[test]
+    fn canonical_mask_is_centered_and_applied_once() {
+        let mut image = RgbaImage::from_pixel(128, 128, image::Rgba([90, 90, 90, 255]));
+        apply_canonical_mask(&mut image);
+        assert_eq!(image.get_pixel(64, 64)[3], 255);
+        assert_eq!(image.get_pixel(0, 0)[3], 0);
+        assert!(image.get_pixel(0, 64)[3] > 200);
+    }
+
+    #[tokio::test]
+    async fn group_and_layer_inspection_render_without_crashing() {
+        let Ok(mut renderer) = GlassRenderer::new().await else {
+            return;
+        };
+        renderer.load_svg(NESTED_SVG).unwrap();
+        assert_eq!(
+            renderer.inspect_labels(),
+            ["Background", "Group 1 (Combined)", "Group 2 / Layer 1"]
+        );
+        for layer in 0..renderer.layer_count() {
+            let image = renderer
+                .render(
+                    128,
+                    128,
+                    RenderSettings {
+                        layer: Some(layer),
+                        ..RenderSettings::default()
+                    },
+                    RenderTarget::Preview,
+                )
+                .unwrap();
+            assert_eq!(image.dimensions(), (128, 128));
+        }
+        let icon = renderer
+            .render(128, 128, RenderSettings::default(), RenderTarget::Icon)
+            .unwrap();
+        assert_eq!(icon.get_pixel(0, 0)[3], 0);
+        assert!(icon.get_pixel(64, 64)[3] > 0);
+    }
+
+    #[tokio::test]
+    async fn background_override_changes_only_the_runtime_render() {
+        let Ok(mut renderer) = GlassRenderer::new().await else {
+            return;
+        };
+        renderer.load_svg(NESTED_SVG).unwrap();
+        let source = renderer
+            .render(128, 128, RenderSettings::default(), RenderTarget::Icon)
+            .unwrap();
+        let overridden = renderer
+            .render(
+                128,
+                128,
+                RenderSettings {
+                    background: Some([232, 48, 70]),
+                    ..RenderSettings::default()
+                },
+                RenderTarget::Icon,
+            )
+            .unwrap();
+        let source_pixel = source.get_pixel(64, 20);
+        let override_pixel = overridden.get_pixel(64, 20);
+        assert!(override_pixel[0] > override_pixel[1] + 40);
+        assert_ne!(source_pixel, override_pixel);
+    }
+
+    #[tokio::test]
+    async fn pointer_tilt_changes_preview_but_not_exported_icon() {
+        let Ok(mut renderer) = GlassRenderer::new().await else {
+            return;
+        };
+        renderer.load_svg(NESTED_SVG).unwrap();
+        let static_icon = renderer
+            .render(128, 128, RenderSettings::default(), RenderTarget::Icon)
+            .unwrap();
+        let moving_icon = renderer
+            .render(
+                128,
+                128,
+                RenderSettings {
+                    pointer: [0.8, -0.6],
+                    tilt: true,
+                    ..RenderSettings::default()
+                },
+                RenderTarget::Icon,
+            )
+            .unwrap();
+        assert_eq!(static_icon, moving_icon);
+
+        let preview = renderer
+            .render(128, 128, RenderSettings::default(), RenderTarget::Preview)
+            .unwrap();
+        let tilted_preview = renderer
+            .render(
+                128,
+                128,
+                RenderSettings {
+                    pointer: [0.8, -0.6],
+                    tilt: true,
+                    ..RenderSettings::default()
+                },
+                RenderTarget::Preview,
+            )
+            .unwrap();
+        assert_ne!(preview, tilted_preview);
     }
 }

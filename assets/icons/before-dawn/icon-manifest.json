@@ -1,0 +1,67 @@
+{
+  "schema_version": 4,
+  "source": {
+    "filename": "before-dawn.png",
+    "sha256": "11c6ee861e049a536925bdf9486bc5402601bd11fd69189f6a71b0dd3abeb15d"
+  },
+  "canvas": {
+    "width": 1024,
+    "height": 1024,
+    "color_space": "sRGB",
+    "has_alpha": true
+  },
+  "svg": "icon.svg",
+  "layers": [
+    {
+      "id": "background",
+      "z_index": 0
+    },
+    {
+      "id": "layer-1-1",
+      "z_index": 1
+    }
+  ],
+  "document": {
+    "background": {
+      "id": "background",
+      "z_index": 0
+    },
+    "groups": [
+      {
+        "id": "group-1",
+        "z_index": 1,
+        "layers": [
+          {
+            "id": "layer-1-1",
+            "z_index": 1
+          }
+        ],
+        "material": {
+          "effects_enabled": true,
+          "mode": "individual",
+          "specular": "automatic",
+          "blur": 0.0,
+          "refraction": [
+            0.5,
+            0.5
+          ],
+          "translucency": 0.5,
+          "shadow": 0.5
+        },
+        "dark": {
+          "opacity": null,
+          "effects_enabled": null
+        },
+        "mono": {
+          "opacity": null,
+          "effects_enabled": null
+        }
+      }
+    ]
+  },
+  "generator": {
+    "provider": "codex-exec",
+    "model": "gpt-5.6-luna",
+    "prompt_version": 7
+  }
+}

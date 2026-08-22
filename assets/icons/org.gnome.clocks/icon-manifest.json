@@ -1,0 +1,193 @@
+{
+  "schema_version": 4,
+  "source": {
+    "filename": "org.gnome.clocks.svg",
+    "sha256": "3a0d7d7ee0d58457b2cd2aedab11b5e3da8822efed0cbd5602c3aad13efaaeec"
+  },
+  "canvas": {
+    "width": 1024,
+    "height": 1024,
+    "color_space": "sRGB",
+    "has_alpha": true
+  },
+  "svg": "icon.svg",
+  "layers": [
+    {
+      "id": "background",
+      "z_index": 0
+    },
+    {
+      "id": "layer-1-1",
+      "z_index": 1
+    },
+    {
+      "id": "layer-2-1",
+      "z_index": 1
+    },
+    {
+      "id": "layer-3-1",
+      "z_index": 1
+    },
+    {
+      "id": "layer-3-2",
+      "z_index": 2
+    },
+    {
+      "id": "layer-3-3",
+      "z_index": 3
+    },
+    {
+      "id": "layer-4-1",
+      "z_index": 1
+    },
+    {
+      "id": "layer-4-2",
+      "z_index": 2
+    }
+  ],
+  "document": {
+    "background": {
+      "id": "background",
+      "z_index": 0
+    },
+    "groups": [
+      {
+        "id": "group-1",
+        "z_index": 1,
+        "layers": [
+          {
+            "id": "layer-1-1",
+            "z_index": 1
+          }
+        ],
+        "material": {
+          "effects_enabled": true,
+          "mode": "individual",
+          "specular": "automatic",
+          "blur": 0.0,
+          "refraction": [
+            0.5,
+            0.5
+          ],
+          "translucency": 0.5,
+          "shadow": 0.5
+        },
+        "dark": {
+          "opacity": null,
+          "effects_enabled": null
+        },
+        "mono": {
+          "opacity": null,
+          "effects_enabled": null
+        }
+      },
+      {
+        "id": "group-2",
+        "z_index": 2,
+        "layers": [
+          {
+            "id": "layer-2-1",
+            "z_index": 1
+          }
+        ],
+        "material": {
+          "effects_enabled": true,
+          "mode": "individual",
+          "specular": "automatic",
+          "blur": 0.0,
+          "refraction": [
+            0.5,
+            0.5
+          ],
+          "translucency": 0.5,
+          "shadow": 0.5
+        },
+        "dark": {
+          "opacity": null,
+          "effects_enabled": null
+        },
+        "mono": {
+          "opacity": null,
+          "effects_enabled": null
+        }
+      },
+      {
+        "id": "group-3",
+        "z_index": 3,
+        "layers": [
+          {
+            "id": "layer-3-1",
+            "z_index": 1
+          },
+          {
+            "id": "layer-3-2",
+            "z_index": 2
+          },
+          {
+            "id": "layer-3-3",
+            "z_index": 3
+          }
+        ],
+        "material": {
+          "effects_enabled": true,
+          "mode": "individual",
+          "specular": "automatic",
+          "blur": 0.0,
+          "refraction": [
+            0.5,
+            0.5
+          ],
+          "translucency": 0.5,
+          "shadow": 0.5
+        },
+        "dark": {
+          "opacity": null,
+          "effects_enabled": null
+        },
+        "mono": {
+          "opacity": null,
+          "effects_enabled": null
+        }
+      },
+      {
+        "id": "group-4",
+        "z_index": 4,
+        "layers": [
+          {
+            "id": "layer-4-1",
+            "z_index": 1
+          },
+          {
+            "id": "layer-4-2",
+            "z_index": 2
+          }
+        ],
+        "material": {
+          "effects_enabled": true,
+          "mode": "individual",
+          "specular": "automatic",
+          "blur": 0.0,
+          "refraction": [
+            0.5,
+            0.5
+          ],
+          "translucency": 0.5,
+          "shadow": 0.5
+        },
+        "dark": {
+          "opacity": null,
+          "effects_enabled": null
+        },
+        "mono": {
+          "opacity": null,
+          "effects_enabled": null
+        }
+      }
+    ]
+  },
+  "generator": {
+    "provider": "codex-exec",
+    "model": "gpt-5.6-luna",
+    "prompt_version": 7
+  }
+}

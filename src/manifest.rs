@@ -1,4 +1,7 @@
-use crate::{error::IconError, model::LayerArtifact};
+use crate::{
+    error::IconError,
+    model::{IconDocument, LayerArtifact},
+};
 use serde::{Deserialize, Serialize};
 use sha2::{Digest, Sha256};
 use std::{fs, path::Path};
@@ -10,6 +13,10 @@ pub struct Manifest {
     pub canvas: CanvasManifest,
     pub svg: String,
     pub layers: Vec<LayerArtifact>,
+    /// v4 stores Icon Composer-style material groups. Older manifests retain
+    /// their flat layer list and are upgraded lazily by `document()`.
+    #[serde(default)]
+    pub document: Option<IconDocument>,
     pub generator: GeneratorManifest,
 }
 
@@ -35,7 +42,7 @@ pub struct GeneratorManifest {
     pub prompt_version: u32,
 }
 
-pub const SCHEMA_VERSION: u32 = 3;
+pub const SCHEMA_VERSION: u32 = 4;
 
 pub fn sha256(bytes: &[u8]) -> String {
     let digest = Sha256::digest(bytes);
@@ -49,10 +56,23 @@ pub fn write_manifest(path: &Path, manifest: &Manifest) -> Result<(), IconError>
 
 pub fn read_manifest(path: &Path) -> Result<Manifest, IconError> {
     let manifest: Manifest = serde_json::from_slice(&fs::read(path)?)?;
-    if !matches!(manifest.schema_version, 2 | SCHEMA_VERSION) || manifest.svg != "icon.svg" {
+    if !matches!(manifest.schema_version, 2 | 3 | SCHEMA_VERSION) || manifest.svg != "icon.svg" {
         return Err(IconError::Manifest(
             "unsupported manifest version".to_owned(),
         ));
     }
+    if manifest.schema_version == SCHEMA_VERSION && manifest.document.is_none() {
+        return Err(IconError::Manifest(
+            "v4 manifest is missing its material document".to_owned(),
+        ));
+    }
     Ok(manifest)
+}
+
+impl Manifest {
+    pub fn document(&self) -> IconDocument {
+        self.document
+            .clone()
+            .unwrap_or_else(|| IconDocument::from_flat_layers(&self.layers))
+    }
 }

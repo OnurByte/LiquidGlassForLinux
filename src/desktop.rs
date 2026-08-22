@@ -525,12 +525,15 @@ fn collect_icon_files(directory: &Path, index: &mut HashMap<String, Vec<PathBuf>
     };
     for entry in entries.flatten() {
         let path = entry.path();
-        let Ok(file_type) = entry.file_type() else {
+        // Flatpak exports icon files as symlinks into the installed app. The
+        // link itself is neither a regular file nor a directory, so inspect
+        // target metadata instead of `DirEntry::file_type()`.
+        let Ok(metadata) = fs::metadata(&path) else {
             continue;
         };
-        if file_type.is_dir() {
+        if metadata.is_dir() {
             collect_icon_files(&path, index);
-        } else if file_type.is_file() && supported_image(&path) {
+        } else if metadata.is_file() && supported_image(&path) {
             if let Some(file_name) = path.file_name().and_then(|value| value.to_str()) {
                 index
                     .entry(file_name.to_owned())
