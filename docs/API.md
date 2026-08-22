@@ -11,9 +11,11 @@ liquid-glass-icon convert --desktop-id ID... [--provider codex|api]
                          [--model MODEL] [--output PATH] [--json]
 liquid-glass-icon apply (--desktop-id ID... | --managed)
                        [--appearance APPEARANCE] [--accent RRGGBB] [--background RRGGBB]
+                       [--foreground-opacity PERCENT]
                        [--output PATH] [--json]
 liquid-glass-icon repair (--desktop-id ID... | --managed)
                         [--appearance APPEARANCE] [--accent RRGGBB] [--background RRGGBB]
+                        [--foreground-opacity PERCENT]
                         [--output PATH] [--json]
 liquid-glass-icon archive [--desktop-id ID]... [--output PATH]
                           [--asset-dir PATH] [--json]
@@ -38,6 +40,11 @@ user changed after installation.
 
 `--background RRGGBB` replaces the source background colour at render time for
 the selected batch. It does not modify the canonical SVG or send an AI request.
+
+`--foreground-opacity PERCENT` accepts 20 through 150 and changes only the
+material/foreground surfaces. The opaque background and canonical SVG are left
+unchanged. Negative-space cutouts expose this runtime background, even when an
+older SVG painted them with its original background colour.
 
 `repair` uses only managed state and the cached canonical SVG. It recreates a
 missing user launcher, replaces wrong-size or fully transparent generated PNGs,

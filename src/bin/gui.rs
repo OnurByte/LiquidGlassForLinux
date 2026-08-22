@@ -106,6 +106,8 @@ struct SavedSettings {
     accent: [u8; 3],
     #[serde(default)]
     background: Option<[u8; 3]>,
+    #[serde(default = "default_foreground_opacity")]
+    foreground_opacity: f32,
     #[serde(default = "default_tilt")]
     tilt: bool,
     #[serde(default)]
@@ -121,6 +123,7 @@ impl Default for SavedSettings {
             appearance: Appearance::TintedLight,
             accent: default_accent(),
             background: None,
+            foreground_opacity: default_foreground_opacity(),
             tilt: true,
             blocked_categories: AppCategory::ALL
                 .into_iter()
@@ -139,6 +142,7 @@ struct IconApp {
     appearance: Appearance,
     accent: [u8; 3],
     background: Option<[u8; 3]>,
+    foreground_opacity: f32,
     tilt: bool,
     api_key: String,
     blocked_categories: HashSet<AppCategory>,
@@ -186,6 +190,7 @@ impl IconApp {
             appearance: saved.appearance,
             accent: saved.accent,
             background: saved.background,
+            foreground_opacity: saved.foreground_opacity.clamp(0.20, 1.50),
             tilt: saved.tilt,
             api_key: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
             blocked_categories: saved.blocked_categories,
@@ -221,6 +226,7 @@ impl IconApp {
         RenderSettings {
             appearance: self.appearance,
             accent: self.accent,
+            foreground_opacity: self.foreground_opacity,
             background: self.background,
             dark_background: self.style_manager.is_dark(),
             pointer: [0.0, 0.0],
@@ -551,6 +557,7 @@ impl IconApp {
             appearance: self.appearance,
             accent: self.accent,
             background: self.background,
+            foreground_opacity: self.foreground_opacity,
             tilt: self.tilt,
             blocked_categories: self.blocked_categories.clone(),
         };
@@ -806,6 +813,12 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
         "Replace every icon background locally — never sent to AI",
     ));
     let reset_background = gtk::Button::with_label("Use source");
+    let foreground_opacity = gtk::Scale::with_range(gtk::Orientation::Horizontal, 20.0, 150.0, 5.0);
+    foreground_opacity.set_digits(0);
+    foreground_opacity.set_value_pos(gtk::PositionType::Right);
+    foreground_opacity.set_tooltip_text(Some(
+        "Opacity for every material layer; background and canonical SVG stay unchanged",
+    ));
 
     {
         let app = state.borrow();
@@ -831,6 +844,7 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
             background[2] as f32 / 255.0,
             1.0,
         ));
+        foreground_opacity.set_value(f64::from(app.foreground_opacity) * 100.0);
         api_key.set_visible(app.provider_choice == ProviderChoice::Api);
     }
 
@@ -868,6 +882,7 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     api_key.set_hexpand(true);
     theme.set_hexpand(true);
     appearance.set_hexpand(true);
+    foreground_opacity.set_hexpand(true);
 
     let controls = gtk::Box::new(gtk::Orientation::Vertical, 12);
     controls.add_css_class("card");
@@ -906,6 +921,8 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     settings_grid.attach(&reset_background, 2, 1, 1, 1);
     settings_grid.attach(&field_label("3D tilt"), 4, 1, 1, 1);
     settings_grid.attach(&tilt, 5, 1, 1, 1);
+    settings_grid.attach(&field_label("Foreground opacity"), 0, 2, 1, 1);
+    settings_grid.attach(&foreground_opacity, 1, 2, 2, 1);
     settings.append(&settings_grid);
 
     let list_scroll = gtk::ScrolledWindow::builder()
@@ -1116,6 +1133,13 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
             app.save();
             app.reapply_cached();
         });
+        let state_for_foreground_opacity = Rc::clone(&state);
+        foreground_opacity.connect_value_changed(move |scale| {
+            let mut app = state_for_foreground_opacity.borrow_mut();
+            app.foreground_opacity = (scale.value() as f32 / 100.0).clamp(0.20, 1.50);
+            app.save();
+            app.reapply_cached();
+        });
         let state_for_tilt = Rc::clone(&state);
         tilt.connect_active_notify(move |toggle| {
             let mut app = state_for_tilt.borrow_mut();
@@ -1220,6 +1244,9 @@ fn default_appearance() -> Appearance {
 }
 fn default_accent() -> [u8; 3] {
     [137, 180, 250]
+}
+fn default_foreground_opacity() -> f32 {
+    1.0
 }
 fn default_tilt() -> bool {
     true

@@ -27,9 +27,11 @@ Use `svg::rasterize_document` when a host needs the background, material groups
 and independent 1024×1024 RGBA child layers. `svg::rasterize_layers` remains
 for flat legacy callers. The bundled GUI passes the document to the WGPU
 renderer. `renderer::RenderSettings` contains runtime appearance, global tint
-and optional global background override; changing it does not invoke a
-provider. `pointer` and `tilt` are preview-only: `RenderTarget::Icon` forces
-them to rest so installed assets are deterministic.
+and optional global background override plus foreground opacity; changing them
+does not invoke a provider. Background-coloured legacy negative space is
+treated as a cutout, so it follows a background override. `pointer` and `tilt`
+are preview-only: `RenderTarget::Icon` forces them to rest so installed assets
+are deterministic.
 
 ## Other languages
 

@@ -5,7 +5,7 @@ use crate::{
     },
     svg::{RasterLayer, rasterize_document, rasterize_layers},
 };
-use image::{RgbaImage, imageops};
+use image::{Rgba, RgbaImage, imageops};
 use std::sync::mpsc;
 use wgpu::util::DeviceExt;
 
@@ -17,7 +17,7 @@ const MAX_TEXTURE_LAYERS: u32 = MAX_SURFACES + 1;
 
 /// Bumped whenever composition or material behavior changes so cached icons
 /// are rebuilt from their canonical SVGs without another AI request.
-pub const RENDERER_REVISION: u32 = 5;
+pub const RENDERER_REVISION: u32 = 6;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderTarget {
@@ -29,6 +29,9 @@ pub enum RenderTarget {
 pub struct RenderSettings {
     pub appearance: Appearance,
     pub accent: [u8; 3],
+    /// Global multiplier for every material surface, independent from the
+    /// opaque source background.
+    pub foreground_opacity: f32,
     /// Replaces only the source colour field at runtime; the canonical SVG
     /// remains the portable source of truth.
     pub background: Option<[u8; 3]>,
@@ -44,6 +47,7 @@ impl Default for RenderSettings {
         Self {
             appearance: Appearance::Default,
             accent: [137, 180, 250],
+            foreground_opacity: 1.0,
             background: None,
             dark_background: false,
             pointer: [0.0, 0.0],
@@ -523,7 +527,7 @@ impl RenderSettings {
             r,
             g,
             b,
-            1.0,
+            self.foreground_opacity.clamp(0.20, 1.50),
             appearance_index(self.appearance),
             surfaces.len() as f32 + 1.0,
             if self.dark_background { 1.0 } else { 0.0 },
@@ -611,6 +615,8 @@ pub fn prepare_canonical_layers(svg: &str) -> Result<Vec<RasterLayer>, IconError
 
 fn prepare_canonical_document(svg: &str) -> Result<PreparedDocument, IconError> {
     let document = rasterize_document(svg)?;
+    let background = document.background.image;
+    let may_contain_legacy_cutouts = source_may_paint_background_colour(svg, &background);
     let mut surfaces = Vec::new();
     for group in document.groups {
         let group_label = group
@@ -627,8 +633,17 @@ fn prepare_canonical_document(svg: &str) -> Result<PreparedDocument, IconError> 
         match group.group.material.mode {
             GroupMode::Individual => {
                 for (index, layer) in group.layers.into_iter().enumerate() {
+                    let mut image = layer.image;
+                    if may_contain_legacy_cutouts {
+                        remove_background_colored_cutouts(
+                            &mut image,
+                            &background,
+                            &mut surfaces,
+                            None,
+                        );
+                    }
                     surfaces.push(MaterialSurface {
-                        image: layer.image,
+                        image,
                         label: format!("{group_label} / Layer {}", index + 1),
                         settings,
                     });
@@ -637,7 +652,16 @@ fn prepare_canonical_document(svg: &str) -> Result<PreparedDocument, IconError> 
             GroupMode::Combined => {
                 let mut image = RgbaImage::new(CANVAS_SIZE, CANVAS_SIZE);
                 for layer in group.layers {
-                    imageops::overlay(&mut image, &layer.image, 0, 0);
+                    let mut layer = layer.image;
+                    if may_contain_legacy_cutouts {
+                        remove_background_colored_cutouts(
+                            &mut layer,
+                            &background,
+                            &mut surfaces,
+                            Some(&mut image),
+                        );
+                    }
+                    imageops::overlay(&mut image, &layer, 0, 0);
                 }
                 surfaces.push(MaterialSurface {
                     image,
@@ -653,9 +677,76 @@ fn prepare_canonical_document(svg: &str) -> Result<PreparedDocument, IconError> 
         ));
     }
     Ok(PreparedDocument {
-        background: document.background.image,
+        background,
         surfaces,
     })
+}
+
+fn source_may_paint_background_colour(svg: &str, background: &RgbaImage) -> bool {
+    let background = background.get_pixel(0, 0);
+    if background[3] != 255 {
+        return false;
+    }
+    let colour = format!(
+        "#{:02x}{:02x}{:02x}",
+        background[0], background[1], background[2]
+    );
+    let lower_svg = svg.to_ascii_lowercase();
+    lower_svg.match_indices(&colour).nth(1).is_some()
+}
+
+/// Old generated SVGs occasionally paint negative space (for example,
+/// Discord's eyes) using the original background colour in a higher layer.
+/// Those pixels are semantic cutouts, so punch them through every material
+/// surface beneath them and leave the runtime background visible.
+fn remove_background_colored_cutouts(
+    layer: &mut RgbaImage,
+    background: &RgbaImage,
+    surfaces: &mut [MaterialSurface],
+    mut combined_surface: Option<&mut RgbaImage>,
+) {
+    for y in 0..CANVAS_SIZE {
+        for x in 0..CANVAS_SIZE {
+            let cutout = *layer.get_pixel(x, y);
+            if !matches_source_background(cutout, *background.get_pixel(x, y)) {
+                continue;
+            }
+            let covered_by_surface = surfaces
+                .iter()
+                .any(|surface| surface.image.get_pixel(x, y)[3] > 0)
+                || combined_surface
+                    .as_deref()
+                    .is_some_and(|surface| surface.get_pixel(x, y)[3] > 0);
+            if !covered_by_surface {
+                continue;
+            }
+            for surface in surfaces.iter_mut() {
+                erase_with_alpha(surface.image.get_pixel_mut(x, y), cutout[3]);
+            }
+            if let Some(surface) = combined_surface.as_deref_mut() {
+                erase_with_alpha(surface.get_pixel_mut(x, y), cutout[3]);
+            }
+            *layer.get_pixel_mut(x, y) = Rgba([0, 0, 0, 0]);
+        }
+    }
+}
+
+fn matches_source_background(pixel: Rgba<u8>, background: Rgba<u8>) -> bool {
+    let alpha = u16::from(pixel[3]);
+    if alpha == 0 || background[3] < 250 {
+        return false;
+    }
+    (0..3).all(|channel| {
+        let expected = u16::from(background[channel]) * alpha / 255;
+        u16::from(pixel[channel]).abs_diff(expected) <= 10
+    })
+}
+
+fn erase_with_alpha(pixel: &mut Rgba<u8>, alpha: u8) {
+    let keep = 255 - u16::from(alpha);
+    for channel in &mut pixel.0 {
+        *channel = (u16::from(*channel) * keep / 255) as u8;
+    }
 }
 
 fn f32_bytes(values: &[f32]) -> Vec<u8> {
@@ -763,7 +854,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         }
         if source_alpha <= 0.0001 { continue; }
         if !effects_enabled {
-            color = mix(color, source.rgb, source_alpha);
+            color = mix(color, source.rgb, source_alpha * params.accent.a);
             continue;
         }
         let shadow_alpha = textureSample(
@@ -772,7 +863,8 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
             sample_uv + vec2<f32>(0.0, 0.004 + optical_settings.z * 0.014 + z * 0.008),
             index,
         ).a;
-        color = color * (1.0 - shadow_alpha * (0.020 + optical_settings.z * 0.100));
+        color = color
+            * (1.0 - shadow_alpha * (0.020 + optical_settings.z * 0.100) * params.accent.a);
 
         let gradient_step = 0.003 + material_settings.z * 0.008;
         let gradient = vec2<f32>(
@@ -812,7 +904,9 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         ) / 3.0;
         let refracted = mix(source.rgb, blurred_behind, 0.04 + material_settings.w * 0.26);
         let material = refracted + specular;
-        let layer_alpha = source_alpha * (0.60 + material_settings.w * 0.28 + z * 0.10);
+        let layer_alpha = source_alpha
+            * (0.60 + material_settings.w * 0.28 + z * 0.10)
+            * params.accent.a;
         color = color * (1.0 - layer_alpha) + material * layer_alpha;
     }
 
@@ -1323,6 +1417,12 @@ mod tests {
 </g>
 </svg>"##;
 
+    const BACKGROUND_COLORED_CUTOUT_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<g id="background"><rect width="1024" height="1024" fill="#5865f2"/></g>
+<g id="group-1"><g id="layer-1-1"><rect x="192" y="256" width="640" height="512" rx="180" fill="#ffffff"/></g></g>
+<g id="group-2"><g id="layer-2-1"><circle cx="406" cy="529" r="64" fill="#5865f2"/><circle cx="618" cy="529" r="64" fill="#5865f2"/></g></g>
+</svg>"##;
+
     #[test]
     fn canonical_layers_keep_the_source_grid() {
         let layers = prepare_canonical_layers(LEGACY_SVG).unwrap();
@@ -1340,6 +1440,35 @@ mod tests {
         assert!(document.surfaces[0].settings.material.effects_enabled);
         assert!(!document.surfaces[1].settings.material.effects_enabled);
         assert!(document.surfaces[0].image.get_pixel(420, 450)[3] > 0);
+    }
+
+    #[test]
+    fn background_colored_foreground_details_become_real_cutouts() {
+        let document = prepare_canonical_document(BACKGROUND_COLORED_CUTOUT_SVG).unwrap();
+        assert_eq!(document.surfaces.len(), 2);
+        assert_eq!(
+            document.background.get_pixel(406, 529).0,
+            [88, 101, 242, 255]
+        );
+        assert_eq!(document.surfaces[0].image.get_pixel(406, 529)[3], 0);
+        assert_eq!(document.surfaces[1].image.get_pixel(406, 529)[3], 0);
+        assert_eq!(document.surfaces[0].image.get_pixel(512, 340)[3], 255);
+    }
+
+    #[test]
+    fn foreground_opacity_is_a_clamped_material_uniform() {
+        let faint = RenderSettings {
+            foreground_opacity: -2.0,
+            ..RenderSettings::default()
+        }
+        .params(RenderTarget::Icon, &[]);
+        let vivid = RenderSettings {
+            foreground_opacity: 3.0,
+            ..RenderSettings::default()
+        }
+        .params(RenderTarget::Icon, &[]);
+        assert_eq!(faint[3], 0.20);
+        assert_eq!(vivid[3], 1.50);
     }
 
     #[test]
@@ -1406,6 +1535,52 @@ mod tests {
         let override_pixel = overridden.get_pixel(64, 20);
         assert!(override_pixel[0] > override_pixel[1] + 40);
         assert_ne!(source_pixel, override_pixel);
+    }
+
+    #[tokio::test]
+    async fn cutouts_follow_the_runtime_background_and_foreground_opacity() {
+        let Ok(mut renderer) = GlassRenderer::new().await else {
+            return;
+        };
+        renderer.load_svg(BACKGROUND_COLORED_CUTOUT_SVG).unwrap();
+        let faint = renderer
+            .render(
+                128,
+                128,
+                RenderSettings {
+                    foreground_opacity: 0.20,
+                    ..RenderSettings::default()
+                },
+                RenderTarget::Icon,
+            )
+            .unwrap();
+        let vivid = renderer
+            .render(
+                128,
+                128,
+                RenderSettings {
+                    foreground_opacity: 1.50,
+                    ..RenderSettings::default()
+                },
+                RenderTarget::Icon,
+            )
+            .unwrap();
+        assert_eq!(faint.get_pixel(64, 16), vivid.get_pixel(64, 16));
+        assert_ne!(faint.get_pixel(64, 64), vivid.get_pixel(64, 64));
+
+        let overridden = renderer
+            .render(
+                128,
+                128,
+                RenderSettings {
+                    background: Some([232, 48, 70]),
+                    ..RenderSettings::default()
+                },
+                RenderTarget::Icon,
+            )
+            .unwrap();
+        let eye = overridden.get_pixel(51, 66);
+        assert!(eye[0] > eye[1] + 50 && eye[0] > eye[2] + 50);
     }
 
     #[tokio::test]

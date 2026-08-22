@@ -45,8 +45,8 @@ Clear, Tinted or preview motion never sends another AI request.
 - Local WGPU material pass with per-group Individual/Combined mode,
   refraction, shadows, specular response, Default/Dark/Clear/Tinted looks and
   one global accent.
-- Batch theme, accent and background controls. They are renderer uniforms,
-  never prompt text and never app-specific AI settings.
+- Batch theme, accent, background and foreground-opacity controls. They are
+  renderer uniforms, never prompt text and never app-specific AI settings.
 - Daily-use categories enabled by default. Avahi/SSH server browsers,
   settings, system helpers and terminal entries stay out until you opt in.
 - User-scoped icon installation with standard 16–1024 px Hicolor assets,
@@ -198,7 +198,7 @@ cargo run --release -- convert \
 # Apply current cached SVGs without calling Codex or the API.
 cargo run --release -- apply \
   --desktop-id org.gnome.Calculator.desktop --appearance tinted-light \
-  --background 263447 --json
+  --background 263447 --foreground-opacity 85 --json
 
 # Repair missing/empty managed icons from their local SVG cache only.
 cargo run --release -- repair --managed --json
@@ -233,6 +233,9 @@ out/apps/org.gnome.Calculator/
   symlinks, so sandboxed applications use their real exported source artwork.
 - Preview supports pointer parallax and an optional **3D tilt** card response.
   These are preview-only; installed Hicolor PNGs always render at rest.
+- Negative space such as Discord's eyes is a real cutout: changing the global
+  background reveals the new background there rather than retaining a painted
+  copy of the original colour. Older generated SVGs are corrected locally.
 - New conversions from this checkout are copied atomically into
   [`assets/icons`](assets/icons/README.md) with their manifests. Use
   `LIQUID_GLASS_ASSET_DIR` to target another collection.

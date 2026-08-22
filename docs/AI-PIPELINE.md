@@ -32,8 +32,10 @@ Schema and return:
 The prompt asks only for identity-preserving flat vector decomposition:
 `background`, then one to four `group-G` groups with one to four direct
 `layer-G-L` children each. It contains no accent, appearance, Dark, Clear or
-Tinted value and requests no glass effect. There is no automatic repair/retry
-request after invalid output.
+Tinted value and requests no glass effect. Negative space is a transparent
+foreground cutout, never a separately painted copy of the background colour.
+Older cached SVGs that used the latter convention are corrected locally during
+rendering. There is no automatic repair/retry request after invalid output.
 
 The Codex child runs ephemerally with user config ignored, so unrelated hooks
 or MCP servers cannot block icon conversion. It has a 120-second process-group

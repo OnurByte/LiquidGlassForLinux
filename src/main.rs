@@ -93,6 +93,8 @@ enum Command {
         accent: Option<String>,
         #[arg(long, value_name = "RRGGBB")]
         background: Option<String>,
+        #[arg(long, value_name = "PERCENT")]
+        foreground_opacity: Option<f32>,
         #[arg(long)]
         output: Option<PathBuf>,
     },
@@ -107,6 +109,8 @@ enum Command {
         accent: Option<String>,
         #[arg(long, value_name = "RRGGBB")]
         background: Option<String>,
+        #[arg(long, value_name = "PERCENT")]
+        foreground_opacity: Option<f32>,
         #[arg(long)]
         output: Option<PathBuf>,
     },
@@ -156,6 +160,40 @@ struct OperationRecord {
     message: String,
 }
 
+#[derive(Clone, Copy)]
+struct RenderOptions<'a> {
+    appearance: AppearanceArg,
+    accent: Option<&'a str>,
+    background: Option<&'a str>,
+    foreground_opacity: Option<f32>,
+    output: Option<&'a Path>,
+}
+
+impl RenderOptions<'_> {
+    fn settings(self) -> anyhow::Result<RenderSettings> {
+        let mut settings = RenderSettings {
+            appearance: self.appearance.into(),
+            ..Default::default()
+        };
+        if let Some(accent) = self.accent {
+            settings.accent = parse_accent(accent)?;
+        }
+        if let Some(background) = self.background {
+            settings.background = Some(parse_accent(background)?);
+        }
+        if let Some(foreground_opacity) = self.foreground_opacity {
+            settings.foreground_opacity = parse_foreground_opacity(foreground_opacity)?;
+        }
+        Ok(settings)
+    }
+
+    fn output(self) -> PathBuf {
+        self.output
+            .map(Path::to_path_buf)
+            .unwrap_or_else(default_output_dir)
+    }
+}
+
 #[derive(Serialize)]
 struct ConvertData {
     provider_request_made: bool,
@@ -200,18 +238,17 @@ async fn main() -> anyhow::Result<()> {
             appearance,
             accent,
             background,
+            foreground_opacity,
             output,
         } => {
-            apply(
-                desktop_id,
-                managed,
+            let render = RenderOptions {
                 appearance,
-                accent.as_deref(),
-                background.as_deref(),
-                output.as_deref(),
-                args.json,
-            )
-            .await
+                accent: accent.as_deref(),
+                background: background.as_deref(),
+                foreground_opacity,
+                output: output.as_deref(),
+            };
+            apply(desktop_id, managed, render, args.json).await
         }
         Command::Restore { desktop_id } => restore(&desktop_id, args.json),
         Command::Repair {
@@ -220,18 +257,17 @@ async fn main() -> anyhow::Result<()> {
             appearance,
             accent,
             background,
+            foreground_opacity,
             output,
         } => {
-            repair(
-                desktop_id,
-                managed,
+            let render = RenderOptions {
                 appearance,
-                accent.as_deref(),
-                background.as_deref(),
-                output.as_deref(),
-                args.json,
-            )
-            .await
+                accent: accent.as_deref(),
+                background: background.as_deref(),
+                foreground_opacity,
+                output: output.as_deref(),
+            };
+            repair(desktop_id, managed, render, args.json).await
         }
         Command::Archive {
             desktop_id,
@@ -281,10 +317,7 @@ fn status(ids: &[String], output: Option<&Path>, compact: bool) -> anyhow::Resul
 async fn repair(
     mut ids: Vec<String>,
     managed: bool,
-    appearance: AppearanceArg,
-    accent: Option<&str>,
-    background: Option<&str>,
-    output: Option<&Path>,
+    render: RenderOptions<'_>,
     compact: bool,
 ) -> anyhow::Result<()> {
     let installer = IconInstaller::default();
@@ -294,19 +327,8 @@ async fn repair(
     if ids.is_empty() {
         anyhow::bail!("provide --desktop-id or --managed");
     }
-    let output = output
-        .map(Path::to_path_buf)
-        .unwrap_or_else(default_output_dir);
-    let mut settings = RenderSettings {
-        appearance: appearance.into(),
-        ..Default::default()
-    };
-    if let Some(accent) = accent {
-        settings.accent = parse_accent(accent)?;
-    }
-    if let Some(background) = background {
-        settings.background = Some(parse_accent(background)?);
-    }
+    let output = render.output();
+    let settings = render.settings()?;
     let mut renderer = GlassRenderer::new().await?;
     let mut records = Vec::new();
     for desktop_id in unique_ids(&ids) {
@@ -444,10 +466,7 @@ async fn convert(
 async fn apply(
     mut ids: Vec<String>,
     managed: bool,
-    appearance: AppearanceArg,
-    accent: Option<&str>,
-    background: Option<&str>,
-    output: Option<&Path>,
+    render: RenderOptions<'_>,
     compact: bool,
 ) -> anyhow::Result<()> {
     let installer = IconInstaller::default();
@@ -458,19 +477,8 @@ async fn apply(
         anyhow::bail!("provide --desktop-id or --managed");
     }
     let applications = select_applications(discover_desktop_applications(), &ids)?;
-    let output = output
-        .map(Path::to_path_buf)
-        .unwrap_or_else(default_output_dir);
-    let mut settings = RenderSettings {
-        appearance: appearance.into(),
-        ..Default::default()
-    };
-    if let Some(accent) = accent {
-        settings.accent = parse_accent(accent)?;
-    }
-    if let Some(background) = background {
-        settings.background = Some(parse_accent(background)?);
-    }
+    let output = render.output();
+    let settings = render.settings()?;
     let mut renderer = GlassRenderer::new().await?;
     let mut records = Vec::with_capacity(applications.len());
     for application in applications {
@@ -587,6 +595,13 @@ fn parse_accent(value: &str) -> anyhow::Result<[u8; 3]> {
     ])
 }
 
+fn parse_foreground_opacity(value: f32) -> anyhow::Result<f32> {
+    if !value.is_finite() || !(20.0..=150.0).contains(&value) {
+        anyhow::bail!("foreground opacity must be a percentage from 20 through 150");
+    }
+    Ok(value / 100.0)
+}
+
 fn emit<T: Serialize>(operation: &'static str, data: T, compact: bool) -> anyhow::Result<()> {
     let envelope = Envelope {
         schema_version: SCHEMA_VERSION,
@@ -617,16 +632,21 @@ mod tests {
             "demo.desktop",
             "--background",
             "263447",
+            "--foreground-opacity",
+            "75",
         ])
         .unwrap();
         assert!(matches!(
             args.command,
             Command::Apply {
                 background: Some(background),
+                foreground_opacity: Some(foreground_opacity),
                 ..
-            } if background == "263447"
+            } if background == "263447" && foreground_opacity == 75.0
         ));
         assert_eq!(parse_accent("#89b4fa").unwrap(), [137, 180, 250]);
         assert!(parse_accent("89b4f").is_err());
+        assert_eq!(parse_foreground_opacity(75.0).unwrap(), 0.75);
+        assert!(parse_foreground_opacity(151.0).is_err());
     }
 }
