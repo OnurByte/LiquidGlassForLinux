@@ -115,6 +115,9 @@ fn svg_prompt_and_appearance_mapping_are_local_only() {
     assert!(!prompt.contains("accent"));
     assert!(!prompt.contains("tinted"));
     assert!(!prompt.contains("clear light"));
+    assert!(prompt.contains("wordmark"));
+    assert!(prompt.contains("co-planar"));
+    assert!(prompt.contains("data-liquid-mode=\"combined\""));
     assert_eq!(appearance_index(Appearance::Default), 0.0);
     assert_eq!(appearance_index(Appearance::TintedDark), 5.0);
     let args = CodexExecProvider::command_args("input.png", "schema.json", "result.json");

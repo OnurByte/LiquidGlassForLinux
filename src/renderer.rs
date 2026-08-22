@@ -13,12 +13,12 @@ use wgpu::util::DeviceExt;
 const GPU_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 /// One opaque background plus at most four Icon Composer groups with four
 /// independent child layers each.
-const MAX_SURFACES: u32 = 16;
-const MAX_TEXTURE_LAYERS: u32 = MAX_SURFACES + 1;
+pub const MAX_SURFACES: usize = 16;
+const MAX_TEXTURE_LAYERS: u32 = MAX_SURFACES as u32 + 1;
 
 /// Bumped whenever composition or material behavior changes so cached icons
 /// are rebuilt from their canonical SVGs without another AI request.
-pub const RENDERER_REVISION: u32 = 7;
+pub const RENDERER_REVISION: u32 = 9;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderTarget {
@@ -36,11 +36,40 @@ pub struct RenderSettings {
     /// Replaces only the source colour field at runtime; the canonical SVG
     /// remains the portable source of truth.
     pub background: Option<[u8; 3]>,
+    /// Local, per-rendered-surface preferences. These never mutate the
+    /// canonical SVG or ask the provider to regenerate an icon.
+    pub surface_overrides: [SurfaceOverride; MAX_SURFACES],
     pub dark_background: bool,
     pub pointer: [f32; 2],
     /// Preview-only perspective response to pointer movement.
     pub tilt: bool,
     pub layer: Option<usize>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, serde::Serialize, serde::Deserialize)]
+pub struct SurfaceOverride {
+    #[serde(default)]
+    pub color: Option<[u8; 3]>,
+    #[serde(default = "default_surface_opacity")]
+    pub opacity: f32,
+    /// One-based depth plane assigned locally by the layer inspector. Absent
+    /// keeps the canonical source order.
+    #[serde(default)]
+    pub plane: Option<u8>,
+}
+
+const fn default_surface_opacity() -> f32 {
+    1.0
+}
+
+impl Default for SurfaceOverride {
+    fn default() -> Self {
+        Self {
+            color: None,
+            opacity: default_surface_opacity(),
+            plane: None,
+        }
+    }
 }
 
 impl Default for RenderSettings {
@@ -50,6 +79,11 @@ impl Default for RenderSettings {
             accent: [137, 180, 250],
             foreground_opacity: 1.0,
             background: None,
+            surface_overrides: [SurfaceOverride {
+                color: None,
+                opacity: 1.0,
+                plane: None,
+            }; MAX_SURFACES],
             dark_background: false,
             pointer: [0.0, 0.0],
             tilt: false,
@@ -166,7 +200,7 @@ impl GlassRenderer {
         self.queue.write_buffer(
             &icon.uniform,
             0,
-            &f32_bytes(&settings.params(target, &icon.surface_settings)),
+            &f32_bytes(&settings.params(target, &icon.surface_settings, icon.background_luminance)),
         );
 
         let mut encoder = self
@@ -261,8 +295,10 @@ impl GlassRenderer {
 /// than its native neighbours.
 pub const MASK_RADIUS: f32 = 0.5;
 pub const MASK_EXPONENT: f32 = 4.2;
-pub const MASK_EDGE_START: f32 = 0.96;
-pub const MASK_EDGE_END: f32 = 1.04;
+// Keep the straight midpoint of the icon fully opaque. Feathering it at 50%
+// made otherwise full-bleed Hicolor icons look inset beside native launchers.
+pub const MASK_EDGE_START: f32 = 1.0;
+pub const MASK_EDGE_END: f32 = 1.075;
 
 fn mask_distance(uv: [f32; 2]) -> f32 {
     let p_x = (uv[0] - 0.5).abs() / MASK_RADIUS;
@@ -373,6 +409,7 @@ struct GlassIcon {
     uniform: wgpu::Buffer,
     surface_settings: Vec<SurfaceSettings>,
     surface_labels: Vec<String>,
+    background_luminance: f32,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -434,12 +471,7 @@ impl GlassIcon {
                 depth_or_array_layers: 1,
             },
         );
-        for (index, surface) in document
-            .surfaces
-            .iter()
-            .take(MAX_SURFACES as usize)
-            .enumerate()
-        {
+        for (index, surface) in document.surfaces.iter().take(MAX_SURFACES).enumerate() {
             queue.write_texture(
                 wgpu::TexelCopyTextureInfo {
                     texture: &texture,
@@ -473,7 +505,7 @@ impl GlassIcon {
         });
         let uniform = device.create_buffer_init(&wgpu::util::BufferInitDescriptor {
             label: Some("liquid-glass-uniform"),
-            contents: &[0; 64 + MAX_SURFACES as usize * 48],
+            contents: &[0; 80 + MAX_SURFACES * 64],
             usage: wgpu::BufferUsages::UNIFORM | wgpu::BufferUsages::COPY_DST,
         });
         let bind_group = device.create_bind_group(&wgpu::BindGroupDescriptor {
@@ -508,12 +540,18 @@ impl GlassIcon {
                 .iter()
                 .map(|surface| surface.label.clone())
                 .collect(),
+            background_luminance: average_linear_luminance(&document.background),
         }
     }
 }
 
 impl RenderSettings {
-    fn params(self, target: RenderTarget, surfaces: &[SurfaceSettings]) -> Vec<f32> {
+    fn params(
+        self,
+        target: RenderTarget,
+        surfaces: &[SurfaceSettings],
+        background_luminance: f32,
+    ) -> Vec<f32> {
         let [r, g, b] = self.accent.map(|channel| f32::from(channel) / 255.0);
         let pointer = if target == RenderTarget::Icon {
             [0.0, 0.0]
@@ -523,7 +561,7 @@ impl RenderSettings {
         let [background_r, background_g, background_b] = self
             .background
             .unwrap_or([0, 0, 0])
-            .map(|channel| f32::from(channel) / 255.0);
+            .map(srgb_channel_to_linear);
         let mut values = vec![
             r,
             g,
@@ -549,8 +587,17 @@ impl RenderSettings {
             background_g,
             background_b,
             if self.background.is_some() { 1.0 } else { 0.0 },
+            background_luminance.max(0.0001),
+            0.0,
+            0.0,
+            0.0,
         ];
-        for index in 0..MAX_SURFACES as usize {
+
+        let mut material_values = Vec::with_capacity(MAX_SURFACES * 4);
+        let mut optical_values = Vec::with_capacity(MAX_SURFACES * 4);
+        let mut annotation_values = Vec::with_capacity(MAX_SURFACES * 4);
+        let mut override_values = Vec::with_capacity(MAX_SURFACES * 4);
+        for index in 0..MAX_SURFACES {
             let settings = surfaces.get(index).copied().unwrap_or(SurfaceSettings {
                 material: MaterialSettings {
                     effects_enabled: false,
@@ -560,23 +607,71 @@ impl RenderSettings {
                 mono: AppearanceAnnotation::default(),
             });
             let material = settings.material;
-            values.extend([
+            let surface_override = self.surface_overrides[index];
+            material_values.extend([
                 if material.effects_enabled { 1.0 } else { 0.0 },
                 specular_index(material.specular),
                 material.blur.clamp(0.0, 1.0),
                 material.translucency.clamp(0.0, 1.0),
+            ]);
+            optical_values.extend([
                 material.refraction[0].clamp(0.0, 1.0),
                 material.refraction[1].clamp(0.0, 1.0),
                 material.shadow.clamp(0.0, 1.0),
+                surface_override.plane.map(f32::from).unwrap_or(-1.0),
+            ]);
+            annotation_values.extend([
                 settings.dark.opacity.unwrap_or(-1.0),
                 settings.mono.opacity.unwrap_or(-1.0),
                 override_index(settings.dark.effects_enabled),
                 override_index(settings.mono.effects_enabled),
-                0.0,
+            ]);
+            let color = surface_override
+                .color
+                .map(|color| color.map(srgb_channel_to_linear))
+                .unwrap_or([-1.0, -1.0, -1.0]);
+            override_values.extend([
+                color[0],
+                color[1],
+                color[2],
+                surface_override.opacity.clamp(0.0, 1.0),
             ]);
         }
+        // WGSL array fields are structure-of-arrays, not one material/optical/
+        // annotation tuple per surface. Keeping these blocks contiguous is
+        // what makes each material surface read its own settings.
+        values.extend(material_values);
+        values.extend(optical_values);
+        values.extend(annotation_values);
+        values.extend(override_values);
         values
     }
+}
+
+fn srgb_channel_to_linear(channel: u8) -> f32 {
+    let channel = f32::from(channel) / 255.0;
+    if channel <= 0.04045 {
+        channel / 12.92
+    } else {
+        ((channel + 0.055) / 1.055).powf(2.4)
+    }
+}
+
+fn average_linear_luminance(image: &RgbaImage) -> f32 {
+    let mut total = 0.0;
+    let mut weight = 0.0;
+    for pixel in image.pixels() {
+        let alpha = f32::from(pixel[3]) / 255.0;
+        if alpha == 0.0 {
+            continue;
+        }
+        total += alpha
+            * (0.2126 * srgb_channel_to_linear(pixel[0])
+                + 0.7152 * srgb_channel_to_linear(pixel[1])
+                + 0.0722 * srgb_channel_to_linear(pixel[2]));
+        weight += alpha;
+    }
+    (total / weight.max(1.0)).max(0.0001)
 }
 
 fn specular_index(mode: SpecularMode) -> f32 {
@@ -672,7 +767,7 @@ fn prepare_canonical_document(svg: &str) -> Result<PreparedDocument, IconError> 
             }
         }
     }
-    if surfaces.is_empty() || surfaces.len() > MAX_SURFACES as usize {
+    if surfaces.is_empty() || surfaces.len() > MAX_SURFACES {
         return Err(gpu_error(
             "icon must resolve to one to sixteen material surfaces",
         ));
@@ -816,9 +911,11 @@ struct Params {
     state: vec4<f32>,
     pointer: vec4<f32>,
     background: vec4<f32>,
+    background_reference: vec4<f32>,
     material: array<vec4<f32>, 16>,
     optical: array<vec4<f32>, 16>,
     annotation: array<vec4<f32>, 16>,
+    surface_override: array<vec4<f32>, 16>,
 }
 
 @group(0) @binding(0) var layers: texture_2d_array<f32>;
@@ -854,7 +951,18 @@ fn preview_background(uv: vec2<f32>) -> vec3<f32> {
 
 fn source_background_color(uv: vec2<f32>) -> vec3<f32> {
     let source = textureSample(layers, layer_sampler, uv, 0);
-    return mix(source.rgb, params.background.rgb, params.background.a);
+    if params.background.a < 0.5 { return source.rgb; }
+    let source_luma = dot(source.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let shade = clamp(source_luma / params.background_reference.x, 0.18, 2.75);
+    return clamp(params.background.rgb * shade, vec3<f32>(0.0), vec3<f32>(1.0));
+}
+
+fn source_with_surface_override(source: vec4<f32>, setting: vec4<f32>) -> vec4<f32> {
+    if setting.x < 0.0 { return vec4<f32>(source.rgb, source.a * setting.w); }
+    let source_luma = dot(source.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
+    let target_luma = max(dot(setting.rgb, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0001);
+    let recolored = clamp(setting.rgb * (source_luma / target_luma), vec3<f32>(0.0), vec3<f32>(1.0));
+    return vec4<f32>(recolored, source.a * setting.w);
 }
 
 fn tilted_uv(uv: vec2<f32>) -> vec2<f32> {
@@ -873,10 +981,11 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     let environment = preview_background(uv + params.pointer.xy * 0.008);
     if params.pointer.z >= 0.0 {
         let selected_index = i32(params.pointer.z + 0.5);
-        let selected = textureSample(layers, layer_sampler, uv, selected_index);
+        var selected = textureSample(layers, layer_sampler, uv, selected_index);
         if selected_index == 0 {
             return vec4(source_background_color(uv), 1.0);
         }
+        selected = source_with_surface_override(selected, params.surface_override[u32(selected_index - 1)]);
         return vec4(mix(environment, selected.rgb, selected.a), 1.0);
     }
 
@@ -889,10 +998,14 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         let material_settings = params.material[surface_index];
         let optical_settings = params.optical[surface_index];
         let annotation = params.annotation[surface_index];
-        let z = f32(index) / foreground_count;
+        let depth_plane = select(f32(index), optical_settings.w, optical_settings.w >= 0.0);
+        let z = depth_plane / foreground_count;
         let parallax = params.pointer.xy * z * 0.036;
         let sample_uv = uv + parallax;
-        let source = textureSample(layers, layer_sampler, sample_uv, index);
+        let source = source_with_surface_override(
+            textureSample(layers, layer_sampler, sample_uv, index),
+            params.surface_override[surface_index],
+        );
         var source_alpha = source.a;
         var effects_enabled = material_settings.x > 0.5;
         if mode > 0.5 && mode < 1.5 {
@@ -943,7 +1056,10 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         var behind = source_background_color(refracted_uv);
         for (var behind_index: i32 = 1; behind_index < 17; behind_index = behind_index + 1) {
             if behind_index >= index { break; }
-            let behind_layer = textureSample(layers, layer_sampler, refracted_uv, behind_index);
+            let behind_layer = source_with_surface_override(
+                textureSample(layers, layer_sampler, refracted_uv, behind_index),
+                params.surface_override[u32(behind_index - 1)],
+            );
             behind = mix(behind, behind_layer.rgb, behind_layer.a);
         }
         let blur_offset = vec2<f32>(material_settings.z * 0.006, 0.0);
@@ -1285,7 +1401,7 @@ mod legacy_safe_zone_tests {
             1.0
         );
         let mid_edge = mask_value(mask_distance([0.5 + MASK_RADIUS, 0.5]));
-        assert!(mid_edge > 0.0 && mid_edge < 1.0, "edge feather {mid_edge}");
+        assert_eq!(mid_edge, 1.0, "midpoint must not look inset");
         assert_eq!(
             mask_value(mask_distance([0.5 + MASK_RADIUS * 1.02, 0.5])),
             0.0
@@ -1479,6 +1595,12 @@ mod tests {
 <g id="group-2"><g id="layer-2-1"><circle cx="406" cy="529" r="64" fill="rgb(88, 101, 242)"/></g></g>
 </svg>"##;
 
+    const GRADIENT_BACKGROUND_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<defs><linearGradient id="background-gradient" x1="0" y1="0" x2="0" y2="1"><stop offset="0" stop-color="#dbeafe"/><stop offset="1" stop-color="#1e3a8a"/></linearGradient></defs>
+<g id="background"><rect width="1024" height="1024" fill="url(#background-gradient)"/></g>
+<g id="group-1"><g id="layer-1-1"><circle cx="512" cy="512" r="140" fill="#ffffff"/></g></g>
+</svg>"##;
+
     #[test]
     fn canonical_layers_keep_the_source_grid() {
         let layers = prepare_canonical_layers(LEGACY_SVG).unwrap();
@@ -1536,14 +1658,73 @@ mod tests {
             foreground_opacity: -2.0,
             ..RenderSettings::default()
         }
-        .params(RenderTarget::Icon, &[]);
+        .params(RenderTarget::Icon, &[], 1.0);
         let vivid = RenderSettings {
             foreground_opacity: 3.0,
             ..RenderSettings::default()
         }
-        .params(RenderTarget::Icon, &[]);
+        .params(RenderTarget::Icon, &[], 1.0);
         assert_eq!(faint[3], 0.20);
         assert_eq!(vivid[3], 1.50);
+    }
+
+    #[test]
+    fn surface_uniforms_are_grouped_for_wgsl_arrays() {
+        let first = SurfaceSettings {
+            material: MaterialSettings {
+                blur: 0.2,
+                ..MaterialSettings::default()
+            },
+            dark: AppearanceAnnotation::default(),
+            mono: AppearanceAnnotation::default(),
+        };
+        let second = SurfaceSettings {
+            material: MaterialSettings {
+                blur: 0.8,
+                ..MaterialSettings::default()
+            },
+            dark: AppearanceAnnotation::default(),
+            mono: AppearanceAnnotation::default(),
+        };
+        let settings = RenderSettings {
+            surface_overrides: [
+                SurfaceOverride {
+                    color: Some([255, 0, 0]),
+                    opacity: 0.4,
+                    plane: Some(1),
+                },
+                SurfaceOverride {
+                    color: Some([0, 255, 0]),
+                    opacity: 0.7,
+                    plane: None,
+                },
+                SurfaceOverride::default(),
+                SurfaceOverride::default(),
+                SurfaceOverride::default(),
+                SurfaceOverride::default(),
+                SurfaceOverride::default(),
+                SurfaceOverride::default(),
+                SurfaceOverride::default(),
+                SurfaceOverride::default(),
+                SurfaceOverride::default(),
+                SurfaceOverride::default(),
+                SurfaceOverride::default(),
+                SurfaceOverride::default(),
+                SurfaceOverride::default(),
+                SurfaceOverride::default(),
+            ],
+            ..RenderSettings::default()
+        }
+        .params(RenderTarget::Icon, &[first, second], 0.5);
+        const BASE: usize = 20;
+        assert_eq!(settings[BASE + 2], 0.2);
+        assert_eq!(settings[BASE + 4 + 2], 0.8);
+        let optical = BASE + MAX_SURFACES * 4;
+        assert_eq!(settings[optical + 3], 1.0);
+        assert_eq!(settings[optical + 7], -1.0);
+        let overrides = BASE + MAX_SURFACES * 12;
+        assert_eq!(settings[overrides + 3], 0.4);
+        assert_eq!(settings[overrides + 7], 0.7);
     }
 
     #[test]
@@ -1610,6 +1791,73 @@ mod tests {
         let override_pixel = overridden.get_pixel(64, 20);
         assert!(override_pixel[0] > override_pixel[1] + 40);
         assert_ne!(source_pixel, override_pixel);
+    }
+
+    #[tokio::test]
+    async fn background_override_preserves_source_gradient_contrast() {
+        let Ok(mut renderer) = GlassRenderer::new().await else {
+            return;
+        };
+        renderer.load_svg(GRADIENT_BACKGROUND_SVG).unwrap();
+        let image = renderer
+            .render(
+                128,
+                128,
+                RenderSettings {
+                    background: Some([220, 48, 48]),
+                    ..RenderSettings::default()
+                },
+                RenderTarget::Icon,
+            )
+            .unwrap();
+        let top = image.get_pixel(64, 20);
+        let bottom = image.get_pixel(64, 108);
+        assert!(top[0] > top[1] + 25 && bottom[0] > bottom[1] + 10);
+        assert!(top[0] > bottom[0] + 20, "gradient was flattened");
+    }
+
+    #[tokio::test]
+    async fn surface_override_recolors_only_the_selected_foreground() {
+        let Ok(mut renderer) = GlassRenderer::new().await else {
+            return;
+        };
+        renderer.load_svg(GRADIENT_BACKGROUND_SVG).unwrap();
+        let image = renderer
+            .render(
+                128,
+                128,
+                RenderSettings {
+                    surface_overrides: [
+                        SurfaceOverride {
+                            color: Some([230, 35, 35]),
+                            opacity: 1.0,
+                            plane: None,
+                        },
+                        SurfaceOverride::default(),
+                        SurfaceOverride::default(),
+                        SurfaceOverride::default(),
+                        SurfaceOverride::default(),
+                        SurfaceOverride::default(),
+                        SurfaceOverride::default(),
+                        SurfaceOverride::default(),
+                        SurfaceOverride::default(),
+                        SurfaceOverride::default(),
+                        SurfaceOverride::default(),
+                        SurfaceOverride::default(),
+                        SurfaceOverride::default(),
+                        SurfaceOverride::default(),
+                        SurfaceOverride::default(),
+                        SurfaceOverride::default(),
+                    ],
+                    ..RenderSettings::default()
+                },
+                RenderTarget::Icon,
+            )
+            .unwrap();
+        let foreground = image.get_pixel(64, 64);
+        let background = image.get_pixel(64, 20);
+        assert!(foreground[0] > foreground[1] + 25);
+        assert_ne!(foreground, background);
     }
 
     #[tokio::test]

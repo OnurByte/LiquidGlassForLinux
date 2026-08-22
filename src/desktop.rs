@@ -148,6 +148,22 @@ pub fn discover_desktop_applications() -> Vec<DesktopApplication> {
     discover_desktop_applications_from_dirs(&application_dirs, &data_dirs)
 }
 
+/// Directories that can announce new desktop entries or top-level icon-theme
+/// changes. The GUI monitors these and reruns normal discovery; it never
+/// generates missing artwork or calls an AI provider from a file event.
+pub fn desktop_watch_directories() -> Vec<PathBuf> {
+    let data_dirs = data_dirs();
+    let mut directories = data_dirs
+        .iter()
+        .map(|directory| directory.join("applications"))
+        .collect::<Vec<_>>();
+    for directory in data_dirs {
+        directories.push(directory.join("icons"));
+        directories.push(directory.join("pixmaps"));
+    }
+    unique_paths(directories)
+}
+
 pub fn discover_desktop_applications_from_dirs(
     application_dirs: &[PathBuf],
     data_dirs: &[PathBuf],

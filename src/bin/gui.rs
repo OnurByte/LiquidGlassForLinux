@@ -1,4 +1,4 @@
-use adw::gtk::{self, gdk, glib};
+use adw::gtk::{self, gdk, gio, glib};
 use adw::prelude::*;
 use adw::{Application, ApplicationWindow, Clamp, HeaderBar, ToolbarView};
 use libadwaita as adw;
@@ -6,20 +6,24 @@ use liquid_glass_icon::{
     AppCategory, Appearance, default_output_dir,
     desktop::{
         DesktopApplication, DesktopTaskEvent, DesktopTaskState, application_output_name,
-        discover_desktop_applications,
+        desktop_watch_directories, discover_desktop_applications,
     },
     icon_install::IconInstaller,
     openai::{CodexExecProvider, DEFAULT_MODEL, OpenAiResponsesClient, SvgProvider},
     pipeline::{CacheStatus, cache_status, transform_desktop_icons_with_options_and_assets},
-    renderer::{GlassRenderer, RenderSettings, RenderTarget, apply_canonical_mask},
+    renderer::{
+        GlassRenderer, MAX_SURFACES, RenderSettings, RenderTarget, SurfaceOverride,
+        apply_canonical_mask,
+    },
     repository_assets_dir,
 };
 use serde::{Deserialize, Serialize};
 use std::{
     cell::{Cell, RefCell},
-    collections::HashSet,
+    collections::{HashMap, HashSet},
     fs,
     path::{Path, PathBuf},
+    process::Command,
     rc::Rc,
     sync::{
         Arc,
@@ -43,6 +47,53 @@ fn preview_pointer(x: f64, y: f64, width: i32, height: i32) -> [f32; 2] {
         ((x / width - 0.5) * 2.0).clamp(-1.0, 1.0) as f32,
         ((y / height - 0.5) * 2.0).clamp(-1.0, 1.0) as f32,
     ]
+}
+
+fn schedule_reapply(state: &Rc<RefCell<IconApp>>, generation: &Rc<Cell<u64>>) {
+    let next = generation.get().wrapping_add(1);
+    generation.set(next);
+    let state = Rc::clone(state);
+    let generation = Rc::clone(generation);
+    glib::timeout_add_local_once(Duration::from_millis(250), move || {
+        if generation.get() != next {
+            return;
+        }
+        if let Ok(mut app) = state.try_borrow_mut() {
+            app.reapply_cached();
+        }
+    });
+}
+
+fn install_source_refresh_monitors(state: &Rc<RefCell<IconApp>>) {
+    let generation = Rc::new(Cell::new(0u64));
+    for directory in desktop_watch_directories()
+        .into_iter()
+        .filter(|directory| directory.is_dir())
+    {
+        let file = gio::File::for_path(directory);
+        let Ok(monitor) =
+            file.monitor_directory(gio::FileMonitorFlags::NONE, gio::Cancellable::NONE)
+        else {
+            continue;
+        };
+        let state_for_event = Rc::clone(state);
+        let generation_for_event = Rc::clone(&generation);
+        monitor.connect_changed(move |_, _, _, _| {
+            let next = generation_for_event.get().wrapping_add(1);
+            generation_for_event.set(next);
+            let state_for_refresh = Rc::clone(&state_for_event);
+            let generation_for_refresh = Rc::clone(&generation_for_event);
+            glib::timeout_add_local_once(Duration::from_millis(600), move || {
+                if generation_for_refresh.get() != next {
+                    return;
+                }
+                if let Ok(mut app) = state_for_refresh.try_borrow_mut() {
+                    app.refresh_applications();
+                }
+            });
+        });
+        state.borrow_mut().source_monitors.push(monitor);
+    }
 }
 
 fn main() {
@@ -112,6 +163,15 @@ struct SavedSettings {
     tilt: bool,
     #[serde(default)]
     blocked_categories: HashSet<AppCategory>,
+    #[serde(default)]
+    layer_overrides: HashMap<String, SavedLayerOverrides>,
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct SavedLayerOverrides {
+    source_sha256: String,
+    #[serde(default)]
+    surfaces: Vec<SurfaceOverride>,
 }
 
 impl Default for SavedSettings {
@@ -129,6 +189,7 @@ impl Default for SavedSettings {
                 .into_iter()
                 .filter(|category| !category.enabled_by_default())
                 .collect(),
+            layer_overrides: HashMap::new(),
         }
     }
 }
@@ -146,6 +207,7 @@ struct IconApp {
     tilt: bool,
     api_key: String,
     blocked_categories: HashSet<AppCategory>,
+    layer_overrides: HashMap<String, SavedLayerOverrides>,
     output: PathBuf,
     status: gtk::Label,
     count: gtk::Label,
@@ -156,6 +218,7 @@ struct IconApp {
     preview_layer: Option<usize>,
     preview_pointer: [f32; 2],
     preview_selector_updating: Rc<Cell<bool>>,
+    layer_editor_dirty: bool,
     receiver: Option<Receiver<DesktopTaskEvent>>,
     cancelled: Arc<AtomicBool>,
     selected: Option<usize>,
@@ -163,6 +226,7 @@ struct IconApp {
     glass: GlassRenderer,
     installer: IconInstaller,
     style_manager: adw::StyleManager,
+    source_monitors: Vec<gio::FileMonitor>,
 }
 
 struct TaskRow {
@@ -194,6 +258,7 @@ impl IconApp {
             tilt: saved.tilt,
             api_key: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
             blocked_categories: saved.blocked_categories,
+            layer_overrides: saved.layer_overrides,
             output,
             status: gtk::Label::new(Some("Ready")),
             count: gtk::Label::new(None),
@@ -204,6 +269,7 @@ impl IconApp {
             preview_layer: None,
             preview_pointer: [0.0, 0.0],
             preview_selector_updating: Rc::new(Cell::new(false)),
+            layer_editor_dirty: true,
             receiver: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             selected: None,
@@ -211,6 +277,7 @@ impl IconApp {
             glass: renderer,
             installer: IconInstaller::default(),
             style_manager,
+            source_monitors: Vec::new(),
         };
         app.repair_cached();
         Ok(app)
@@ -222,17 +289,153 @@ impl IconApp {
             .contains(&self.applications[index].category)
     }
 
-    fn render_settings(&self) -> RenderSettings {
+    fn refresh_applications(&mut self) {
+        if self.receiver.is_some() {
+            return;
+        }
+        let selected_id = self
+            .selected
+            .and_then(|index| self.applications.get(index))
+            .map(|application| application.id.clone());
+        let applications = discover_desktop_applications();
+        let tasks = applications
+            .iter()
+            .map(|application| initial_task(application, &self.output))
+            .collect();
+        self.applications = applications;
+        self.tasks = tasks;
+        self.selected = selected_id.and_then(|id| {
+            self.applications
+                .iter()
+                .position(|application| application.id == id)
+        });
+        self.list_dirty = true;
+        self.status
+            .set_text("Applications and source icons refreshed locally");
+        if let Some(index) = self.selected {
+            self.load_preview(index, true);
+        } else {
+            self.preview.set_paintable(Option::<&gdk::Paintable>::None);
+        }
+    }
+
+    fn install_gnome_parallax(&mut self) {
+        let script =
+            Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install-gnome-parallax.sh");
+        match Command::new(&script).output() {
+            Ok(output) if output.status.success() => {
+                let message = String::from_utf8_lossy(&output.stdout);
+                self.status.set_text(message.trim());
+            }
+            Ok(output) => {
+                let message = String::from_utf8_lossy(&output.stderr);
+                self.status
+                    .set_text(&format!("GNOME extension: {}", message.trim()));
+            }
+            Err(error) => self
+                .status
+                .set_text(&format!("GNOME extension installer unavailable: {error}")),
+        }
+    }
+
+    fn render_settings_for(&self, desktop_id: &str, svg: &str) -> RenderSettings {
         RenderSettings {
             appearance: self.appearance,
             accent: self.accent,
             foreground_opacity: self.foreground_opacity,
             background: self.background,
+            surface_overrides: self.surface_overrides_for(desktop_id, svg),
             dark_background: self.style_manager.is_dark(),
             pointer: [0.0, 0.0],
             tilt: false,
             layer: None,
         }
+    }
+
+    fn surface_overrides_for(
+        &self,
+        desktop_id: &str,
+        svg: &str,
+    ) -> [SurfaceOverride; MAX_SURFACES] {
+        let mut overrides = [SurfaceOverride::default(); MAX_SURFACES];
+        let source_sha256 = liquid_glass_icon::manifest::sha256(svg.as_bytes());
+        let Some(saved) = self.layer_overrides.get(desktop_id) else {
+            return overrides;
+        };
+        if saved.source_sha256 != source_sha256 {
+            return overrides;
+        }
+        for (target, source) in overrides.iter_mut().zip(&saved.surfaces) {
+            *target = *source;
+        }
+        overrides
+    }
+
+    fn selected_surface_override(&self) -> Option<SurfaceOverride> {
+        let index = self.preview_layer?.checked_sub(1)?;
+        let selected = self.selected?;
+        let svg = fs::read_to_string(
+            app_output(&self.output, &self.applications[selected]).join("icon.svg"),
+        )
+        .ok()?;
+        self.surface_overrides_for(&self.applications[selected].id, &svg)
+            .get(index)
+            .copied()
+    }
+
+    fn update_selected_surface_override(&mut self, update: impl FnOnce(&mut SurfaceOverride)) {
+        let Some(surface_index) = self.preview_layer.and_then(|layer| layer.checked_sub(1)) else {
+            return;
+        };
+        let Some(selected) = self.selected else {
+            return;
+        };
+        let application = &self.applications[selected];
+        let Ok(svg) = fs::read_to_string(app_output(&self.output, application).join("icon.svg"))
+        else {
+            return;
+        };
+        let source_sha256 = liquid_glass_icon::manifest::sha256(svg.as_bytes());
+        let saved = self
+            .layer_overrides
+            .entry(application.id.clone())
+            .or_default();
+        if saved.source_sha256 != source_sha256 {
+            saved.source_sha256 = source_sha256;
+            saved.surfaces.clear();
+        }
+        saved
+            .surfaces
+            .resize(MAX_SURFACES, SurfaceOverride::default());
+        update(&mut saved.surfaces[surface_index]);
+        self.save();
+        self.layer_editor_dirty = true;
+        self.render_preview();
+    }
+
+    fn combine_selected_surface_with_previous(&mut self) {
+        let Some(surface_index) = self.preview_layer.and_then(|layer| layer.checked_sub(1)) else {
+            return;
+        };
+        if surface_index == 0 {
+            return;
+        }
+        let previous_plane = self
+            .selected_surface_override_for(surface_index - 1)
+            .and_then(|surface| surface.plane)
+            .unwrap_or(surface_index as u8);
+        self.update_selected_surface_override(|surface| surface.plane = Some(previous_plane));
+    }
+
+    fn selected_surface_override_for(&self, surface_index: usize) -> Option<SurfaceOverride> {
+        let selected = self.selected?;
+        let svg = fs::read_to_string(
+            app_output(&self.output, &self.applications[selected]).join("icon.svg"),
+        )
+        .ok()?;
+        self.surface_overrides_for(&self.applications[selected].id, &svg)
+            .get(surface_index)
+            .copied()
     }
 
     fn rebuild_list(state: &Rc<RefCell<Self>>) {
@@ -289,6 +492,7 @@ impl IconApp {
 
     fn select(&mut self, index: usize) {
         self.selected = Some(index);
+        self.layer_editor_dirty = true;
         self.preview_title.set_text(&self.applications[index].name);
         if self.tasks[index].state == DesktopTaskState::Converted
             && let Err(error) = self.apply_icon(index)
@@ -358,6 +562,7 @@ impl IconApp {
             .unwrap_or(0);
         // Composite (0) is not an icon layer.
         self.preview_layer = preview_layer_from_selection(selected as u32);
+        self.layer_editor_dirty = true;
         self.preview_selector_updating.set(true);
         self.preview_selector
             .set_model(Some(&gtk::StringList::new(&label_refs)));
@@ -367,13 +572,22 @@ impl IconApp {
 
     fn set_preview_layer(&mut self, selected: u32) {
         self.preview_layer = preview_layer_from_selection(selected);
+        self.layer_editor_dirty = true;
         if self.selected.is_some() {
             self.render_preview();
         }
     }
 
     fn preview_settings(&self) -> RenderSettings {
-        let mut settings = self.render_settings();
+        let mut settings = self
+            .selected
+            .and_then(|index| {
+                let application = &self.applications[index];
+                fs::read_to_string(app_output(&self.output, application).join("icon.svg"))
+                    .ok()
+                    .map(|svg| self.render_settings_for(&application.id, &svg))
+            })
+            .unwrap_or_default();
         settings.layer = self.preview_layer;
         settings.pointer = self.preview_pointer;
         settings.tilt = self.tilt;
@@ -539,7 +753,7 @@ impl IconApp {
             app_output(&self.output, &self.applications[index]).join("icon.svg"),
         )
         .map_err(|error| error.to_string())?;
-        let settings = self.render_settings();
+        let settings = self.render_settings_for(&self.applications[index].id, &svg);
         self.installer
             .apply_svg(&self.applications[index], &svg, &mut self.glass, settings)
             .map_err(|error| error.to_string())?;
@@ -560,6 +774,7 @@ impl IconApp {
             foreground_opacity: self.foreground_opacity,
             tilt: self.tilt,
             blocked_categories: self.blocked_categories.clone(),
+            layer_overrides: self.layer_overrides.clone(),
         };
         let path = config_path();
         if let Some(parent) = path.parent() {
@@ -580,7 +795,6 @@ impl IconApp {
             self.appearance = tinted_for(self.style_manager.is_dark());
         }
         self.save();
-        self.reapply_cached();
     }
 
     fn reapply_cached(&mut self) {
@@ -592,7 +806,6 @@ impl IconApp {
                 return;
             }
         };
-        let settings = self.render_settings();
         let mut applied = 0;
         let mut failed = 0;
         for desktop_id in ids {
@@ -603,6 +816,7 @@ impl IconApp {
             let result = fs::read_to_string(svg_path)
                 .map_err(|error| error.to_string())
                 .and_then(|svg| {
+                    let settings = self.render_settings_for(&desktop_id, &svg);
                     self.installer
                         .repair_cached_svg(&desktop_id, &svg, &mut self.glass, settings)
                         .map_err(|error| error.to_string())
@@ -667,10 +881,10 @@ impl IconApp {
                 .output
                 .join(application_output_name(&desktop_id))
                 .join("icon.svg");
-            let settings = self.render_settings();
             let result = fs::read_to_string(svg_path)
                 .map_err(|error| error.to_string())
                 .and_then(|svg| {
+                    let settings = self.render_settings_for(&desktop_id, &svg);
                     self.installer
                         .repair_cached_svg(&desktop_id, &svg, &mut self.glass, settings)
                         .map_err(|error| error.to_string())
@@ -787,6 +1001,7 @@ fn field_label(text: &str) -> gtk::Label {
 }
 
 fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
+    install_source_refresh_monitors(&state);
     let (list, preview, preview_title, status) = {
         let app = state.borrow();
         (
@@ -818,6 +1033,7 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     let stop = gtk::Button::with_label("Stop");
     stop.add_css_class("destructive-action");
     stop.set_sensitive(false);
+    let refresh_applications = gtk::Button::with_label("Refresh applications");
 
     let theme = gtk::DropDown::from_strings(&["System", "Light", "Dark"]);
     let appearance = gtk::DropDown::from_strings(&[
@@ -848,6 +1064,17 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     foreground_opacity.set_tooltip_text(Some(
         "Opacity for every material layer; background and canonical SVG stay unchanged",
     ));
+    let layer_color_dialog = gtk::ColorDialog::new();
+    layer_color_dialog.set_with_alpha(false);
+    let layer_color = gtk::ColorDialogButton::new(Some(layer_color_dialog));
+    layer_color.set_tooltip_text(Some("Recolor only the selected foreground surface locally"));
+    let layer_opacity = gtk::Scale::with_range(gtk::Orientation::Horizontal, 0.0, 100.0, 1.0);
+    layer_opacity.set_digits(0);
+    layer_opacity.set_value_pos(gtk::PositionType::Right);
+    layer_opacity.set_tooltip_text(Some("Opacity for the selected foreground surface"));
+    let reset_layer = gtk::Button::with_label("Reset layer");
+    let same_plane = gtk::Button::with_label("Same plane as previous");
+    let layer_editor_updating = Rc::new(Cell::new(false));
 
     {
         let app = state.borrow();
@@ -929,6 +1156,7 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     actions.set_halign(gtk::Align::End);
     actions.append(&generate);
     actions.append(&stop);
+    actions.append(&refresh_applications);
     actions.append(&categories);
     controls_grid.attach(&actions, 0, 2, 4, 1);
     controls.append(&controls_grid);
@@ -953,6 +1181,40 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     settings_grid.attach(&field_label("Foreground opacity"), 0, 2, 1, 1);
     settings_grid.attach(&foreground_opacity, 1, 2, 2, 1);
     settings.append(&settings_grid);
+
+    let integrations = gtk::Box::new(gtk::Orientation::Vertical, 10);
+    integrations.add_css_class("card");
+    integrations.append(&section_label("Desktop integrations"));
+    let gnome_install = gtk::Button::with_label("Install GNOME parallax");
+    gnome_install.set_tooltip_text(Some(
+        "Installs and enables the GNOME Shell extension; a logout may still be required",
+    ));
+    let integrations_grid = gtk::Grid::new();
+    integrations_grid.set_column_spacing(12);
+    integrations_grid.set_row_spacing(8);
+    integrations_grid.attach(&field_label("GNOME Shell"), 0, 0, 1, 1);
+    integrations_grid.attach(&gnome_install, 1, 0, 1, 1);
+    integrations_grid.attach(&field_label("KDE Plasma"), 0, 1, 1, 1);
+    integrations_grid.attach(
+        &gtk::Label::new(Some(
+            "Static Liquid Glass icons are supported; no fragile launcher patch.",
+        )),
+        1,
+        1,
+        1,
+        1,
+    );
+    integrations_grid.attach(&field_label("Hyprland"), 0, 2, 1, 1);
+    integrations_grid.attach(
+        &gtk::Label::new(Some(
+            "Static Liquid Glass icons are supported; dynamic panel ownership varies.",
+        )),
+        1,
+        2,
+        1,
+        1,
+    );
+    integrations.append(&integrations_grid);
 
     let list_scroll = gtk::ScrolledWindow::builder()
         .vexpand(true)
@@ -984,6 +1246,16 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     preview_selector.set_hexpand(true);
     preview_controls.append(&preview_selector);
     preview_heading.append(&preview_controls);
+    let layer_controls = gtk::Grid::new();
+    layer_controls.set_column_spacing(8);
+    layer_controls.set_row_spacing(6);
+    layer_controls.attach(&field_label("Layer color"), 0, 0, 1, 1);
+    layer_controls.attach(&layer_color, 1, 0, 1, 1);
+    layer_controls.attach(&field_label("Layer opacity"), 2, 0, 1, 1);
+    layer_controls.attach(&layer_opacity, 3, 0, 1, 1);
+    layer_controls.attach(&same_plane, 1, 1, 1, 1);
+    layer_controls.attach(&reset_layer, 3, 1, 1, 1);
+    layer_controls.set_sensitive(false);
     let preview_surface = gtk::Box::new(gtk::Orientation::Vertical, 0);
     preview_surface.add_css_class("preview-surface");
     preview_surface.set_vexpand(true);
@@ -1022,6 +1294,7 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     right.set_hexpand(true);
     right.set_vexpand(true);
     right.append(&preview_heading);
+    right.append(&layer_controls);
     right.append(&preview_surface);
 
     let content = gtk::Box::new(gtk::Orientation::Horizontal, 18);
@@ -1047,6 +1320,7 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     root.append(&hero);
     root.append(&controls);
     root.append(&settings);
+    root.append(&integrations);
     root.append(&content);
     root.append(&status);
     let clamp = Clamp::new();
@@ -1075,10 +1349,21 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
         .build();
 
     {
+        let reapply_generation = Rc::new(Cell::new(0));
         let state_for_generate = Rc::clone(&state);
         generate.connect_clicked(move |_| state_for_generate.borrow_mut().start_missing());
         let state_for_stop = Rc::clone(&state);
         stop.connect_clicked(move |_| state_for_stop.borrow_mut().stop());
+        let state_for_refresh = Rc::clone(&state);
+        refresh_applications.connect_clicked(move |_| {
+            state_for_refresh.borrow_mut().refresh_applications();
+        });
+        let state_for_gnome_install = Rc::clone(&state);
+        gnome_install.connect_clicked(move |_| {
+            state_for_gnome_install
+                .borrow_mut()
+                .install_gnome_parallax();
+        });
         let state_for_provider = Rc::clone(&state);
         let api_key_for_visibility = api_key.clone();
         provider.connect_selected_notify(move |dropdown| {
@@ -1115,59 +1400,134 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
             }
         });
         let state_for_theme = Rc::clone(&state);
+        let reapply_for_theme = Rc::clone(&reapply_generation);
         theme.connect_selected_notify(move |dropdown| {
             state_for_theme
                 .borrow_mut()
-                .set_theme(theme_from_index(dropdown.selected()))
+                .set_theme(theme_from_index(dropdown.selected()));
+            schedule_reapply(&state_for_theme, &reapply_for_theme);
         });
         let state_for_appearance = Rc::clone(&state);
+        let reapply_for_appearance = Rc::clone(&reapply_generation);
         appearance.connect_selected_notify(move |dropdown| {
-            let mut app = state_for_appearance.borrow_mut();
-            app.appearance = Appearance::ALL
-                .get(dropdown.selected() as usize)
-                .copied()
-                .unwrap_or(Appearance::TintedLight);
-            app.save();
-            app.reapply_cached();
+            {
+                let mut app = state_for_appearance.borrow_mut();
+                app.appearance = Appearance::ALL
+                    .get(dropdown.selected() as usize)
+                    .copied()
+                    .unwrap_or(Appearance::TintedLight);
+                app.save();
+            }
+            schedule_reapply(&state_for_appearance, &reapply_for_appearance);
         });
         let state_for_color = Rc::clone(&state);
+        let reapply_for_color = Rc::clone(&reapply_generation);
         color.connect_rgba_notify(move |button| {
             let rgba = button.rgba();
-            let mut app = state_for_color.borrow_mut();
-            app.accent = [
-                (rgba.red() * 255.0) as u8,
-                (rgba.green() * 255.0) as u8,
-                (rgba.blue() * 255.0) as u8,
-            ];
-            app.appearance = tinted_for(app.style_manager.is_dark());
-            app.save();
-            app.reapply_cached();
+            {
+                let mut app = state_for_color.borrow_mut();
+                app.accent = [
+                    (rgba.red() * 255.0) as u8,
+                    (rgba.green() * 255.0) as u8,
+                    (rgba.blue() * 255.0) as u8,
+                ];
+                app.appearance = tinted_for(app.style_manager.is_dark());
+                app.save();
+            }
+            schedule_reapply(&state_for_color, &reapply_for_color);
         });
         let state_for_background = Rc::clone(&state);
+        let reapply_for_background = Rc::clone(&reapply_generation);
         background_color.connect_rgba_notify(move |button| {
             let rgba = button.rgba();
-            let mut app = state_for_background.borrow_mut();
-            app.background = Some([
-                (rgba.red() * 255.0) as u8,
-                (rgba.green() * 255.0) as u8,
-                (rgba.blue() * 255.0) as u8,
-            ]);
-            app.save();
-            app.reapply_cached();
+            {
+                let mut app = state_for_background.borrow_mut();
+                app.background = Some([
+                    (rgba.red() * 255.0) as u8,
+                    (rgba.green() * 255.0) as u8,
+                    (rgba.blue() * 255.0) as u8,
+                ]);
+                app.save();
+            }
+            schedule_reapply(&state_for_background, &reapply_for_background);
         });
         let state_for_background_reset = Rc::clone(&state);
+        let reapply_for_background_reset = Rc::clone(&reapply_generation);
         reset_background.connect_clicked(move |_| {
-            let mut app = state_for_background_reset.borrow_mut();
-            app.background = None;
-            app.save();
-            app.reapply_cached();
+            {
+                let mut app = state_for_background_reset.borrow_mut();
+                app.background = None;
+                app.save();
+            }
+            schedule_reapply(&state_for_background_reset, &reapply_for_background_reset);
         });
         let state_for_foreground_opacity = Rc::clone(&state);
+        let reapply_for_foreground_opacity = Rc::clone(&reapply_generation);
         foreground_opacity.connect_value_changed(move |scale| {
-            let mut app = state_for_foreground_opacity.borrow_mut();
-            app.foreground_opacity = (scale.value() as f32 / 100.0).clamp(0.20, 1.50);
-            app.save();
-            app.reapply_cached();
+            {
+                let mut app = state_for_foreground_opacity.borrow_mut();
+                app.foreground_opacity = (scale.value() as f32 / 100.0).clamp(0.20, 1.50);
+                app.save();
+            }
+            schedule_reapply(
+                &state_for_foreground_opacity,
+                &reapply_for_foreground_opacity,
+            );
+        });
+        let state_for_layer_color = Rc::clone(&state);
+        let reapply_for_layer_color = Rc::clone(&reapply_generation);
+        let layer_color_guard = Rc::clone(&layer_editor_updating);
+        layer_color.connect_rgba_notify(move |button| {
+            if layer_color_guard.get() {
+                return;
+            }
+            let rgba = button.rgba();
+            {
+                let mut app = state_for_layer_color.borrow_mut();
+                app.update_selected_surface_override(|surface| {
+                    surface.color = Some([
+                        (rgba.red() * 255.0) as u8,
+                        (rgba.green() * 255.0) as u8,
+                        (rgba.blue() * 255.0) as u8,
+                    ]);
+                });
+            }
+            schedule_reapply(&state_for_layer_color, &reapply_for_layer_color);
+        });
+        let state_for_layer_opacity = Rc::clone(&state);
+        let reapply_for_layer_opacity = Rc::clone(&reapply_generation);
+        let layer_opacity_guard = Rc::clone(&layer_editor_updating);
+        layer_opacity.connect_value_changed(move |scale| {
+            if layer_opacity_guard.get() {
+                return;
+            }
+            {
+                let mut app = state_for_layer_opacity.borrow_mut();
+                app.update_selected_surface_override(|surface| {
+                    surface.opacity = (scale.value() as f32 / 100.0).clamp(0.0, 1.0);
+                });
+            }
+            schedule_reapply(&state_for_layer_opacity, &reapply_for_layer_opacity);
+        });
+        let state_for_reset_layer = Rc::clone(&state);
+        let reapply_for_reset_layer = Rc::clone(&reapply_generation);
+        reset_layer.connect_clicked(move |_| {
+            {
+                let mut app = state_for_reset_layer.borrow_mut();
+                app.update_selected_surface_override(|surface| {
+                    *surface = SurfaceOverride::default()
+                });
+            }
+            schedule_reapply(&state_for_reset_layer, &reapply_for_reset_layer);
+        });
+        let state_for_same_plane = Rc::clone(&state);
+        let reapply_for_same_plane = Rc::clone(&reapply_generation);
+        same_plane.connect_clicked(move |_| {
+            {
+                let mut app = state_for_same_plane.borrow_mut();
+                app.combine_selected_surface_with_previous();
+            }
+            schedule_reapply(&state_for_same_plane, &reapply_for_same_plane);
         });
         let state_for_tilt = Rc::clone(&state);
         tilt.connect_active_notify(move |toggle| {
@@ -1181,15 +1541,47 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     }
 
     let state_for_tick = Rc::clone(&state);
+    let layer_controls_for_tick = layer_controls.clone();
+    let layer_color_for_tick = layer_color.clone();
+    let layer_opacity_for_tick = layer_opacity.clone();
+    let same_plane_for_tick = same_plane.clone();
+    let layer_editor_guard_for_tick = Rc::clone(&layer_editor_updating);
     glib::timeout_add_local(Duration::from_millis(100), move || {
-        let (running, list_dirty) = {
+        let (running, list_dirty, layer, layer_index, layer_editor_dirty) = {
             let mut app = state_for_tick.borrow_mut();
             let running = app.receiver.is_some();
             app.receive_events();
-            (running, app.list_dirty)
+            let layer_index = app.preview_layer.and_then(|layer| layer.checked_sub(1));
+            let layer_editor_dirty = std::mem::take(&mut app.layer_editor_dirty);
+            let layer = layer_editor_dirty
+                .then(|| app.selected_surface_override())
+                .flatten();
+            (
+                running,
+                app.list_dirty,
+                layer,
+                layer_index,
+                layer_editor_dirty,
+            )
         };
         generate.set_sensitive(!running);
         stop.set_sensitive(running);
+        if layer_editor_dirty {
+            layer_controls_for_tick.set_sensitive(layer.is_some());
+            same_plane_for_tick.set_sensitive(layer_index.is_some_and(|index| index > 0));
+        }
+        if let Some(layer) = layer {
+            layer_editor_guard_for_tick.set(true);
+            let color = layer.color.unwrap_or([255, 255, 255]);
+            layer_color_for_tick.set_rgba(&gdk::RGBA::new(
+                color[0] as f32 / 255.0,
+                color[1] as f32 / 255.0,
+                color[2] as f32 / 255.0,
+                1.0,
+            ));
+            layer_opacity_for_tick.set_value(f64::from(layer.opacity) * 100.0);
+            layer_editor_guard_for_tick.set(false);
+        }
         if list_dirty {
             IconApp::rebuild_list(&state_for_tick);
         }

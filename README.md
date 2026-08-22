@@ -45,8 +45,11 @@ Clear, Tinted or preview motion never sends another AI request.
 - Local WGPU material pass with per-group Individual/Combined mode,
   refraction, shadows, specular response, Default/Dark/Clear/Tinted looks and
   one global accent.
-- Batch theme, accent, background and foreground-opacity controls. They are
-  renderer uniforms, never prompt text and never app-specific AI settings.
+- Batch theme, accent, gradient-preserving background and foreground-opacity
+  controls. They are renderer uniforms, never prompt text and never AI work.
+- Per-app layer inspector with local surface color, opacity and co-planar
+  normalization controls. White artwork can be recolored (for example, red)
+  without rewriting the canonical SVG.
 - Daily-use categories enabled by default. Avahi/SSH server browsers,
   settings, system helpers and terminal entries stay out until you opt in.
 - User-scoped icon installation with standard 16–1024 px Hicolor assets,
@@ -107,6 +110,11 @@ of silently mirroring or re-centring it.
 The canonical SVG deliberately contains no accent, appearance, blur, glow,
 refraction or permanent shadow. A single converted asset can therefore produce
 many local looks without being regenerated.
+
+When a global background colour is selected, the renderer retains the source
+background's relative light/dark values instead of flattening a source
+gradient. Layer preferences are keyed to the canonical SVG hash, so a future
+reconversion cannot accidentally inherit a colour intended for older artwork.
 
 ## Linux liquid-glass landscape
 
@@ -231,6 +239,21 @@ the installed icons static. GNOME Shell runs extension code in the Shell
 process; on Wayland, log out and back in once after installing or changing the
 extension source.
 
+## Install from GitHub
+
+The bootstrap script clones the project under your user data directory, refuses
+to overwrite a dirty prior checkout, builds the release binaries and installs
+the desktop launcher without `sudo`:
+
+```bash
+curl -fsSL https://raw.githubusercontent.com/OnurByte/LiquidGlassForLinux/main/scripts/install-from-github.sh | bash
+```
+
+It requires `git` and Rust `cargo`; it intentionally does not run a package
+manager. In the GUI, **Desktop integrations** installs/enables the real GNOME
+parallax extension. KDE Plasma and Hyprland cards explicitly report static
+icon support rather than promising a shell integration they do not own.
+
 Generated data looks like this:
 
 ```text
@@ -252,6 +275,9 @@ out/apps/org.gnome.Calculator/
   overrides. Original launchers remain available through **Restore**.
 - Icon discovery follows normal XDG icon directories and Flatpak export
   symlinks, so sandboxed applications use their real exported source artwork.
+- The GUI watches XDG application/icon roots and refreshes source resolution
+  locally when entries change; this never queues an AI request. Use **Refresh
+  applications** to force the same safe rescan immediately.
 - Preview supports pointer parallax and an optional **3D tilt** card response.
   These are preview-only; installed Hicolor PNGs always render at rest.
 - Negative space such as Discord's eyes is a real cutout: changing the global
