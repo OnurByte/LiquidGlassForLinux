@@ -322,7 +322,7 @@ impl IconApp {
     fn install_gnome_parallax(&mut self) {
         let script =
             Path::new(env!("CARGO_MANIFEST_DIR")).join("scripts/install-gnome-parallax.sh");
-        match Command::new(&script).output() {
+        match Command::new(&script).arg("--system").output() {
             Ok(output) if output.status.success() => {
                 let message = String::from_utf8_lossy(&output.stdout);
                 self.status.set_text(message.trim());
@@ -1179,9 +1179,9 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     let integrations = gtk::Box::new(gtk::Orientation::Vertical, 10);
     integrations.add_css_class("card");
     integrations.append(&section_label("Desktop integrations"));
-    let gnome_install = gtk::Button::with_label("Install GNOME parallax");
+    let gnome_install = gtk::Button::with_label("Install GNOME parallax (admin)");
     gnome_install.set_tooltip_text(Some(
-        "Installs and enables the GNOME Shell extension; a logout may still be required",
+        "Prompts for your administrator password, installs system-wide, then enables the GNOME Shell extension",
     ));
     let integrations_grid = gtk::Grid::new();
     integrations_grid.set_column_spacing(12);
@@ -1333,7 +1333,13 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     header.set_title_widget(Some(&header_stack));
     let toolbar = ToolbarView::new();
     toolbar.add_top_bar(&header);
-    toolbar.set_content(Some(&clamp));
+    let root_scroll = gtk::ScrolledWindow::builder()
+        .hexpand(true)
+        .vexpand(true)
+        .hscrollbar_policy(gtk::PolicyType::Never)
+        .child(&clamp)
+        .build();
+    toolbar.set_content(Some(&root_scroll));
     let window = ApplicationWindow::builder()
         .application(application)
         .title("Liquid Glass Icons")
