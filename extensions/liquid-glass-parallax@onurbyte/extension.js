@@ -8,6 +8,7 @@ const MAX_OFFSET = 7;
 const EFFECT_RADIUS = 2.25;
 const MIN_ICON_SIZE = 16;
 const MAX_ICON_SIZE = 256;
+const ACTOR_SCAN_INTERVAL_US = 250_000;
 
 export default class LiquidGlassParallaxExtension extends Extension {
     enable() {
@@ -18,6 +19,8 @@ export default class LiquidGlassParallaxExtension extends Extension {
         ]));
         this._managedIds = new Set();
         this._actors = new Map();
+        this._iconActors = new Set();
+        this._nextActorScan = 0;
         this._reloadManagedIds();
         this._monitor = this._managedFile.monitor_file(Gio.FileMonitorFlags.NONE, null);
         this._monitorId = this._monitor.connect('changed', () => this._reloadManagedIds());
@@ -38,6 +41,7 @@ export default class LiquidGlassParallaxExtension extends Extension {
         this._monitor?.cancel();
         this._restoreAll();
         this._actors = null;
+        this._iconActors = null;
         this._managedIds = null;
         this._monitor = null;
         this._motionId = 0;
@@ -56,17 +60,30 @@ export default class LiquidGlassParallaxExtension extends Extension {
             console.warn(`Liquid Glass parallax: could not read managed icon state: ${error.message}`);
         }
         this._managedIds = managedIds;
+        this._nextActorScan = 0;
         this._restoreAll();
     }
 
     _applyParallax(pointerX, pointerY) {
+        this._refreshIconActors();
         const currentActors = new Set();
-        for (const actor of this._managedIconActors()) {
-            currentActors.add(actor);
-            const [x, y] = actor.get_transformed_position();
-            const [width, height] = actor.get_transformed_size();
-            if (width < MIN_ICON_SIZE || height < MIN_ICON_SIZE || width > MAX_ICON_SIZE || height > MAX_ICON_SIZE)
+        for (const actor of this._iconActors) {
+            let x;
+            let y;
+            let width;
+            let height;
+            try {
+                [x, y] = actor.get_transformed_position();
+                [width, height] = actor.get_transformed_size();
+            } catch (_) {
+                this._restore(actor);
                 continue;
+            }
+            if (width < MIN_ICON_SIZE || height < MIN_ICON_SIZE || width > MAX_ICON_SIZE || height > MAX_ICON_SIZE) {
+                this._restore(actor);
+                continue;
+            }
+            currentActors.add(actor);
             const radius = Math.max(width, height) * EFFECT_RADIUS;
             const dx = (pointerX - (x + width / 2)) / radius;
             const dy = (pointerY - (y + height / 2)) / radius;
@@ -86,6 +103,14 @@ export default class LiquidGlassParallaxExtension extends Extension {
             if (!currentActors.has(actor))
                 this._restore(actor);
         }
+    }
+
+    _refreshIconActors() {
+        const now = GLib.get_monotonic_time();
+        if (now < this._nextActorScan)
+            return;
+        this._iconActors = new Set(this._managedIconActors());
+        this._nextActorScan = now + ACTOR_SCAN_INTERVAL_US;
     }
 
     *_managedIconActors() {

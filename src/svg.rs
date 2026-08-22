@@ -354,7 +354,20 @@ fn render_node_to_canvas(tree: &resvg::usvg::Tree, id: &str) -> Result<RgbaImage
         &mut pixmap.as_mut(),
     )
     .ok_or_else(|| invalid(format!("empty layer {id}")))?;
-    let layer = RgbaImage::from_raw(CANVAS_SIZE, CANVAS_SIZE, pixmap.take())
+    // tiny-skia stores premultiplied pixels. The renderer samples ordinary
+    // straight-alpha textures, so normalize at the one SVG-to-texture boundary.
+    let mut pixels = pixmap.take();
+    for pixel in pixels.chunks_exact_mut(4) {
+        let alpha = u16::from(pixel[3]);
+        if alpha == 0 {
+            pixel[..3].fill(0);
+            continue;
+        }
+        for channel in &mut pixel[..3] {
+            *channel = ((u16::from(*channel) * 255 + alpha / 2) / alpha).min(255) as u8;
+        }
+    }
+    let layer = RgbaImage::from_raw(CANVAS_SIZE, CANVAS_SIZE, pixels)
         .ok_or_else(|| invalid("invalid rasterized layer"))?;
     if layer.pixels().all(|pixel| pixel[3] == 0) {
         return Err(invalid(format!("layer {id} is empty inside the canvas")));

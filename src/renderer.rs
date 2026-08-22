@@ -6,6 +6,7 @@ use crate::{
     svg::{RasterLayer, rasterize_document, rasterize_layers},
 };
 use image::{Rgba, RgbaImage, imageops};
+use roxmltree::Document;
 use std::sync::mpsc;
 use wgpu::util::DeviceExt;
 
@@ -17,7 +18,7 @@ const MAX_TEXTURE_LAYERS: u32 = MAX_SURFACES + 1;
 
 /// Bumped whenever composition or material behavior changes so cached icons
 /// are rebuilt from their canonical SVGs without another AI request.
-pub const RENDERER_REVISION: u32 = 6;
+pub const RENDERER_REVISION: u32 = 7;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderTarget {
@@ -687,12 +688,58 @@ fn source_may_paint_background_colour(svg: &str, background: &RgbaImage) -> bool
     if background[3] != 255 {
         return false;
     }
-    let colour = format!(
-        "#{:02x}{:02x}{:02x}",
-        background[0], background[1], background[2]
-    );
-    let lower_svg = svg.to_ascii_lowercase();
-    lower_svg.match_indices(&colour).nth(1).is_some()
+    let Ok(document) = Document::parse(svg) else {
+        return false;
+    };
+    document
+        .descendants()
+        .filter(|node| {
+            node.is_element()
+                && !node
+                    .ancestors()
+                    .any(|ancestor| ancestor.attribute("id") == Some("background"))
+        })
+        .flat_map(|node| [node.attribute("fill"), node.attribute("stroke")])
+        .flatten()
+        .any(|paint| paint_matches_source_background(paint, *background))
+}
+
+fn paint_matches_source_background(paint: &str, background: Rgba<u8>) -> bool {
+    parse_svg_paint_rgb(paint)
+        .is_some_and(|rgb| rgb == [background[0], background[1], background[2]])
+}
+
+fn parse_svg_paint_rgb(paint: &str) -> Option<[u8; 3]> {
+    let paint = paint.trim();
+    if let Some(hex) = paint.strip_prefix('#') {
+        if hex.len() == 3 {
+            let mut rgb = [0; 3];
+            for (index, channel) in hex.bytes().enumerate() {
+                let value = char::from(channel).to_digit(16)? as u8;
+                rgb[index] = value * 17;
+            }
+            return Some(rgb);
+        }
+        if hex.len() == 6 {
+            return Some([
+                u8::from_str_radix(&hex[0..2], 16).ok()?,
+                u8::from_str_radix(&hex[2..4], 16).ok()?,
+                u8::from_str_radix(&hex[4..6], 16).ok()?,
+            ]);
+        }
+    }
+    let values = paint
+        .strip_prefix("rgb(")
+        .or_else(|| paint.strip_prefix("rgba("))?
+        .strip_suffix(')')?;
+    let mut channels = values
+        .split(|character: char| character == ',' || character.is_ascii_whitespace())
+        .filter(|value| !value.is_empty());
+    Some([
+        channels.next()?.parse().ok()?,
+        channels.next()?.parse().ok()?,
+        channels.next()?.parse().ok()?,
+    ])
 }
 
 /// Old generated SVGs occasionally paint negative space (for example,
@@ -737,15 +784,18 @@ fn matches_source_background(pixel: Rgba<u8>, background: Rgba<u8>) -> bool {
         return false;
     }
     (0..3).all(|channel| {
-        let expected = u16::from(background[channel]) * alpha / 255;
-        u16::from(pixel[channel]).abs_diff(expected) <= 10
+        let pixel = u16::from(pixel[channel]);
+        let straight = u16::from(background[channel]);
+        let premultiplied = straight * alpha / 255;
+        pixel.abs_diff(straight).min(pixel.abs_diff(premultiplied)) <= 10
     })
 }
 
 fn erase_with_alpha(pixel: &mut Rgba<u8>, alpha: u8) {
     let keep = 255 - u16::from(alpha);
-    for channel in &mut pixel.0 {
-        *channel = (u16::from(*channel) * keep / 255) as u8;
+    pixel[3] = (u16::from(pixel[3]) * keep / 255) as u8;
+    if pixel[3] == 0 {
+        pixel.0[..3].fill(0);
     }
 }
 
@@ -1423,6 +1473,12 @@ mod tests {
 <g id="group-2"><g id="layer-2-1"><circle cx="406" cy="529" r="64" fill="#5865f2"/><circle cx="618" cy="529" r="64" fill="#5865f2"/></g></g>
 </svg>"##;
 
+    const RGB_SYNTAX_CUTOUT_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<g id="background"><rect width="1024" height="1024" fill="#5865f2"/></g>
+<g id="group-1"><g id="layer-1-1"><rect x="192" y="256" width="640" height="512" rx="180" fill="#ffffff"/></g></g>
+<g id="group-2"><g id="layer-2-1"><circle cx="406" cy="529" r="64" fill="rgb(88, 101, 242)"/></g></g>
+</svg>"##;
+
     #[test]
     fn canonical_layers_keep_the_source_grid() {
         let layers = prepare_canonical_layers(LEGACY_SVG).unwrap();
@@ -1453,6 +1509,25 @@ mod tests {
         assert_eq!(document.surfaces[0].image.get_pixel(406, 529)[3], 0);
         assert_eq!(document.surfaces[1].image.get_pixel(406, 529)[3], 0);
         assert_eq!(document.surfaces[0].image.get_pixel(512, 340)[3], 255);
+    }
+
+    #[test]
+    fn rgb_background_colored_details_are_cut_out_too() {
+        let document = prepare_canonical_document(RGB_SYNTAX_CUTOUT_SVG).unwrap();
+        assert_eq!(document.surfaces[0].image.get_pixel(406, 529)[3], 0);
+        assert_eq!(document.surfaces[1].image.get_pixel(406, 529)[3], 0);
+    }
+
+    #[test]
+    fn rasterized_layers_use_straight_alpha() {
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<g id="background"><rect width="1024" height="1024" fill="#203050"/></g>
+<g id="group-1"><g id="layer-1-1"><rect x="100" y="100" width="200" height="200" fill="#ffffff" opacity="0.5"/></g></g>
+</svg>"##;
+        let document = rasterize_document(svg).unwrap();
+        let pixel = document.groups[0].layers[0].image.get_pixel(150, 150);
+        assert!((120..=135).contains(&pixel[3]));
+        assert!(pixel[0] > 245 && pixel[1] > 245 && pixel[2] > 245);
     }
 
     #[test]
@@ -1580,6 +1655,8 @@ mod tests {
             )
             .unwrap();
         let eye = overridden.get_pixel(51, 66);
+        let background = overridden.get_pixel(16, 64);
+        assert_eq!(eye, background);
         assert!(eye[0] > eye[1] + 50 && eye[0] > eye[2] + 50);
     }
 

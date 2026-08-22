@@ -68,8 +68,9 @@ flowchart LR
     C -->|Blocked by default| X[Opt in from Categories]
     X --> D
     D --> E{Cached manifest?}
-    E -->|Current| F[Reuse layered SVG]
-    E -->|Missing or stale| G[One Codex exec or API request]
+    E -->|Current or legacy| F[Reuse layered SVG]
+    E -->|Missing| G[One Codex exec or API request]
+    E -->|Stale| Y[Mark stale; wait for explicit Reconvert]
     G --> H[Validate SVG + write manifest]
     H --> F
     F --> I[Local WGPU renderer]
