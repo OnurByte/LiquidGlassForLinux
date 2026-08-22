@@ -9,7 +9,7 @@ use wgpu::util::DeviceExt;
 
 const GPU_FORMAT: wgpu::TextureFormat = wgpu::TextureFormat::Rgba8UnormSrgb;
 const MAX_LAYERS: u32 = 5;
-const ICON_ARTWORK_SIZE: u32 = 760;
+const ICON_ARTWORK_SIZE: u32 = 820;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderTarget {
@@ -70,7 +70,8 @@ impl GlassRenderer {
     }
 
     pub fn load_svg(&mut self, svg: &str) -> Result<(), IconError> {
-        let layers = fit_layers_to_icon_frame(rasterize_layers(svg)?);
+        let layers =
+            fit_layers_to_icon_frame(normalize_full_bleed_background(rasterize_layers(svg)?));
         self.icon = Some(GlassIcon::new(
             &self.device,
             &self.queue,
@@ -445,6 +446,13 @@ pub fn appearance_index(appearance: Appearance) -> f32 {
 }
 
 fn fit_layers_to_icon_frame(mut layers: Vec<RasterLayer>) -> Vec<RasterLayer> {
+    if layers
+        .iter()
+        .skip(1)
+        .any(|layer| is_full_canvas_layer(&layer.image))
+    {
+        return layers;
+    }
     let Some((min_x, min_y, max_x, max_y)) = foreground_bounds(&layers) else {
         return layers;
     };
@@ -474,6 +482,69 @@ fn fit_layers_to_icon_frame(mut layers: Vec<RasterLayer>) -> Vec<RasterLayer> {
         layer.image = framed;
     }
     layers
+}
+
+fn normalize_full_bleed_background(mut layers: Vec<RasterLayer>) -> Vec<RasterLayer> {
+    let Some(background_layer) = layers.get(1) else {
+        return layers;
+    };
+    if !is_circle_background(&background_layer.image) {
+        return layers;
+    }
+
+    let center = background_layer
+        .image
+        .get_pixel(CANVAS_SIZE / 2, CANVAS_SIZE / 2);
+    let fill = [center[0], center[1], center[2]];
+    for pixel in layers[0].image.pixels_mut() {
+        pixel[0] = fill[0];
+        pixel[1] = fill[1];
+        pixel[2] = fill[2];
+        pixel[3] = 255;
+    }
+    for pixel in layers[1].image.pixels_mut() {
+        pixel[0] = fill[0];
+        pixel[1] = fill[1];
+        pixel[2] = fill[2];
+        pixel[3] = 255;
+    }
+    layers
+}
+
+fn is_circle_background(image: &RgbaImage) -> bool {
+    if image.dimensions() != (CANVAS_SIZE, CANVAS_SIZE) {
+        return false;
+    }
+    let edge = CANVAS_SIZE - 1;
+    let center = CANVAS_SIZE / 2;
+    let edge_pixels = [
+        image.get_pixel(0, center),
+        image.get_pixel(edge, center),
+        image.get_pixel(center, 0),
+        image.get_pixel(center, edge),
+    ];
+    let corner_pixels = [
+        image.get_pixel(0, 0),
+        image.get_pixel(edge, 0),
+        image.get_pixel(0, edge),
+        image.get_pixel(edge, edge),
+    ];
+    edge_pixels.iter().all(|pixel| pixel[3] > 16) && corner_pixels.iter().all(|pixel| pixel[3] < 16)
+}
+
+fn is_full_canvas_layer(image: &RgbaImage) -> bool {
+    if image.dimensions() != (CANVAS_SIZE, CANVAS_SIZE) {
+        return false;
+    }
+    let edge = CANVAS_SIZE - 1;
+    [
+        image.get_pixel(0, 0),
+        image.get_pixel(edge, 0),
+        image.get_pixel(0, edge),
+        image.get_pixel(edge, edge),
+    ]
+    .iter()
+    .all(|pixel| pixel[3] > 200)
 }
 
 fn foreground_bounds(layers: &[RasterLayer]) -> Option<(u32, u32, u32, u32)> {
@@ -576,18 +647,19 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         let depth_gap = vec2<f32>(0.0, -0.008) * z;
         let sample_uv = uv + parallax + depth_gap;
         let source = textureSample(layers, layer_sampler, sample_uv, index);
-        let shadow = textureSample(
-            layers,
-            layer_sampler,
-            sample_uv + vec2<f32>(0.015, 0.022) * (0.55 + z),
-            index,
-        );
-        color = color * (1.0 - shadow.a * (0.18 + z * 0.16));
+        let depth_shadow = source.a * (0.08 + z * 0.08);
+        color = color * (1.0 - depth_shadow);
 
-        let edge_x = textureSample(layers, layer_sampler, sample_uv + vec2<f32>(0.006, 0.0), index).a;
-        let edge_y = textureSample(layers, layer_sampler, sample_uv + vec2<f32>(0.0, 0.006), index).a;
-        let edge = clamp(abs(source.a - edge_x) + abs(source.a - edge_y), 0.0, 1.0);
-        let specular = vec3<f32>(0.78, 0.86, 1.0) * edge * (0.16 + z * 0.16);
+        let edge_x = abs(
+            textureSample(layers, layer_sampler, sample_uv + vec2<f32>(0.006, 0.0), index).a
+                - textureSample(layers, layer_sampler, sample_uv - vec2<f32>(0.006, 0.0), index).a,
+        );
+        let edge_y = abs(
+            textureSample(layers, layer_sampler, sample_uv + vec2<f32>(0.0, 0.006), index).a
+                - textureSample(layers, layer_sampler, sample_uv - vec2<f32>(0.0, 0.006), index).a,
+        );
+        let edge = clamp(edge_x + edge_y, 0.0, 1.0);
+        let specular = vec3<f32>(0.82, 0.90, 1.0) * edge * (0.20 + z * 0.18);
         let refracted = mix(source.rgb, color, 0.08 + z * 0.10);
         let material = refracted + specular;
         let layer_alpha = source.a * (0.72 + z * 0.24);
@@ -611,7 +683,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         glass_mix = 0.58;
     } else if mode > 3.5 {
         artwork = accent_tone;
-        glass_mix = select(0.34, 0.46, mode > 4.5);
+        glass_mix = select(0.50, 0.56, mode > 4.5);
     }
 
     let edge = smoothstep(
@@ -621,7 +693,7 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
     );
     let refracted = select(color, environment, params.state.w < 0.5);
     var glass = mix(artwork, refracted, glass_mix);
-    let highlight = pow(max(0.0, 1.0 - distance(uv, vec2<f32>(0.34, 0.28)) * 1.8), 4.0) * 0.28;
+    let highlight = pow(max(0.0, 1.0 - distance(uv, vec2<f32>(0.5, 0.24)) * 1.8), 4.0) * 0.22;
     glass = glass + vec3<f32>(highlight + edge * 0.10);
 
     if params.state.w > 0.5 {
@@ -662,6 +734,60 @@ mod tests {
         assert!(bounds.2 - bounds.0 < ICON_ARTWORK_SIZE + 2);
         assert!(bounds.3 - bounds.1 < ICON_ARTWORK_SIZE + 2);
         assert_eq!(layers[0].image.get_pixel(0, 0)[3], 255);
+    }
+
+    #[test]
+    fn normalizes_full_bleed_circle_into_the_system_mask() {
+        let mut background = RgbaImage::new(CANVAS_SIZE, CANVAS_SIZE);
+        for pixel in background.pixels_mut() {
+            *pixel = image::Rgba([0, 0, 0, 255]);
+        }
+        let mut circle = RgbaImage::new(CANVAS_SIZE, CANVAS_SIZE);
+        for pixel in circle.pixels_mut() {
+            *pixel = image::Rgba([88, 101, 242, 255]);
+        }
+        for (x, y) in [
+            (0, 0),
+            (CANVAS_SIZE - 1, 0),
+            (0, CANVAS_SIZE - 1),
+            (CANVAS_SIZE - 1, CANVAS_SIZE - 1),
+        ] {
+            circle.put_pixel(x, y, image::Rgba([88, 101, 242, 0]));
+        }
+        let mut logo = RgbaImage::new(CANVAS_SIZE, CANVAS_SIZE);
+        for y in 200..300 {
+            for x in 200..300 {
+                logo.put_pixel(x, y, image::Rgba([255, 255, 255, 255]));
+            }
+        }
+
+        let layers = normalize_full_bleed_background(vec![
+            RasterLayer {
+                id: "background".to_owned(),
+                image: background,
+            },
+            RasterLayer {
+                id: "foreground-1".to_owned(),
+                image: circle,
+            },
+            RasterLayer {
+                id: "foreground-2".to_owned(),
+                image: logo,
+            },
+        ]);
+        assert_eq!(layers[0].image.get_pixel(0, 0).0, [88, 101, 242, 255]);
+        assert_eq!(layers[1].image.get_pixel(0, 0).0, [88, 101, 242, 255]);
+        let fitted = fit_layers_to_icon_frame(layers);
+        assert_eq!(fitted[1].image.dimensions(), (CANVAS_SIZE, CANVAS_SIZE));
+        assert_eq!(fitted[2].image.get_pixel(200, 200)[3], 255);
+        assert_eq!(fitted[2].image.get_pixel(150, 150)[3], 0);
+
+        let svg = r##"<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<g id="background"><rect width="1024" height="1024" fill="#000000"/></g>
+<g id="foreground-1"><circle cx="512" cy="512" r="512" fill="#5865F2"/></g>
+</svg>"##;
+        let actual = normalize_full_bleed_background(rasterize_layers(svg).unwrap());
+        assert!(is_full_canvas_layer(&actual[1].image));
     }
 
     #[tokio::test]

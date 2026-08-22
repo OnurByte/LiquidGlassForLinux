@@ -27,7 +27,7 @@ Mono + user tint -> Tinted Light / Tinted Dark
 
 Tint is a global runtime uniform. It is not an application-specific AI
 instruction and does not cause regeneration. Before WGPU compositing, the
-combined foreground alpha bounds are contained in a centered 760 px safe-area
+combined foreground alpha bounds are contained in a centered 820 px safe-area
 inside the 1024 px canvas. This keeps triangular, portrait and wide artwork
 recognizable inside the rounded-square mask without changing the canonical SVG.
 Each foreground is composited at its normalized z position with a small static

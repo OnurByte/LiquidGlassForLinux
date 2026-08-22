@@ -69,9 +69,15 @@ async fn main() -> anyhow::Result<()> {
         }
     }
     let discovered = discover_desktop_applications();
-    let applications = discovered
+    let requested_ids = args.reconvert.iter().cloned().collect::<HashSet<_>>();
+    let eligible = discovered
         .iter()
         .filter(|application| args.all_categories || application.category.enabled_by_default())
+        .collect::<Vec<_>>();
+    let eligible_count = eligible.len();
+    let applications = eligible
+        .into_iter()
+        .filter(|application| requested_ids.is_empty() || requested_ids.contains(&application.id))
         .cloned()
         .collect::<Vec<_>>();
     if applications.is_empty() {
@@ -123,9 +129,14 @@ async fn main() -> anyhow::Result<()> {
         }
     };
     let force_ids = args.reconvert.into_iter().collect::<HashSet<_>>();
-    let skipped = discovered.len().saturating_sub(applications.len());
+    let skipped = discovered.len().saturating_sub(eligible_count);
+    let scope = if requested_ids.is_empty() {
+        "discovered"
+    } else {
+        "selected"
+    };
     println!(
-        "discovered {} application icons ({} category-blocked; use --all-categories to include)",
+        "{scope} {} application icons ({} category-blocked; use --all-categories to include)",
         applications.len(),
         skipped
     );
