@@ -457,16 +457,12 @@ async fn local_renderer_application_writes_real_linux_icon_sizes() {
     let mut renderer = liquid_glass_icon::renderer::GlassRenderer::new()
         .await
         .unwrap();
+    let settings = liquid_glass_icon::renderer::RenderSettings {
+        appearance: Appearance::TintedLight,
+        ..Default::default()
+    };
     installer
-        .apply_svg(
-            &application,
-            &canonical_svg(),
-            &mut renderer,
-            liquid_glass_icon::renderer::RenderSettings {
-                appearance: Appearance::TintedLight,
-                ..Default::default()
-            },
-        )
+        .apply_svg(&application, &canonical_svg(), &mut renderer, settings)
         .unwrap();
     let desktop_path = data_home.join("applications/demo.desktop");
     let desktop = fs::read_to_string(&desktop_path).unwrap();
@@ -476,12 +472,27 @@ async fn local_renderer_application_writes_real_linux_icon_sizes() {
         .unwrap()
         .to_owned();
     assert!(first_icon.starts_with("liquid-glass-demo-"));
-    assert!(data_home.join("icons/hicolor/index.theme").is_file());
+    assert_eq!(
+        fs::read(data_home.join("icons/hicolor/index.theme")).unwrap(),
+        fs::read("/usr/share/icons/hicolor/index.theme").unwrap()
+    );
     for size in [16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024] {
         let path = data_home
             .join("icons/hicolor")
             .join(format!("{size}x{size}/apps/{first_icon}.png"));
-        assert_eq!(image::open(path).unwrap().dimensions(), (size, size));
+        let installed = image::open(path).unwrap().into_rgba8();
+        assert_eq!(installed.dimensions(), (size, size));
+        assert_eq!(
+            installed,
+            renderer
+                .render(
+                    size,
+                    size,
+                    settings,
+                    liquid_glass_icon::renderer::RenderTarget::Icon,
+                )
+                .unwrap()
+        );
     }
 
     installer
@@ -650,6 +661,62 @@ async fn cancelled_batch_makes_no_provider_request() {
     assert!(results.is_empty());
     assert_eq!(states, [DesktopTaskState::Stopped]);
     assert_eq!(mock.hits(), 0);
+}
+
+#[tokio::test]
+async fn batch_starts_no_more_than_ten_conversions_before_one_completes() {
+    let server = MockServer::start_async().await;
+    let mock = server
+        .mock_async(|when, then| {
+            when.method(POST).path("/v1/responses");
+            then.status(200)
+                .delay(Duration::from_millis(250))
+                .json_body(serde_json::json!({
+                    "output": [{"content": [{"type": "output_text", "text": serde_json::to_string(&serde_json::json!({"svg": canonical_svg()})).unwrap()}]}]
+                }));
+        })
+        .await;
+    let provider = SvgProvider::Responses(
+        OpenAiResponsesClient::new("test-key", &server.url("/v1/responses")).unwrap(),
+    );
+    let root = tempdir().unwrap();
+    let applications = (0..11)
+        .map(|index| {
+            let mut application = application(root.path(), &png_bytes([index, 2, 3, 255]));
+            application.id = format!("demo-{index}.desktop");
+            application.name = format!("Demo {index}");
+            application.desktop_file = root.path().join(&application.id);
+            application
+        })
+        .collect::<Vec<_>>();
+    let mut states = Vec::new();
+    let results = transform_desktop_icons_with_options(
+        &applications,
+        &root.path().join("out"),
+        &provider,
+        Arc::new(AtomicBool::new(false)),
+        &HashSet::new(),
+        |event| states.push(event.state),
+    )
+    .await;
+
+    assert_eq!(results.len(), 11);
+    assert_eq!(mock.hits(), 11);
+    let first_completed = states
+        .iter()
+        .position(|state| *state == DesktopTaskState::Completed)
+        .unwrap();
+    let eleventh_processing = states
+        .iter()
+        .enumerate()
+        .filter(|(_, state)| **state == DesktopTaskState::Processing)
+        .nth(10)
+        .map(|(index, _)| index)
+        .unwrap();
+    assert!(
+        first_completed < eleventh_processing,
+        "the eleventh conversion started before any of the first ten completed"
+    );
 }
 
 #[tokio::test]

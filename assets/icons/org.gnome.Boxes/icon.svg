@@ -1,0 +1,32 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <g id="background">
+    <rect x="0" y="0" width="1024" height="1024" fill="#000000"/>
+  </g>
+  <g id="group-1">
+    <g id="layer-1-1">
+      <path d="M160 150H864M160 860H864M160 150V860M864 150V860" fill="none" stroke="#f7f7f5" stroke-width="54" stroke-linecap="butt" stroke-linejoin="round"/>
+    </g>
+    <g id="layer-1-2">
+      <path d="M160 150L350 350M864 150L675 350M160 860L350 675M864 860L675 675" fill="none" stroke="#f7f7f5" stroke-width="50" stroke-linecap="butt" stroke-linejoin="round"/>
+    </g>
+  </g>
+  <g id="group-2">
+    <g id="layer-2-1">
+      <path d="M350 350H675M350 675H675M350 350V675M675 350V675" fill="none" stroke="#f7f7f5" stroke-width="50" stroke-linecap="butt" stroke-linejoin="round"/>
+    </g>
+  </g>
+  <g id="group-3">
+    <g id="layer-3-1">
+      <circle cx="160" cy="150" r="101" fill="#f7f7f5"/>
+      <circle cx="864" cy="150" r="101" fill="#f7f7f5"/>
+      <circle cx="160" cy="860" r="101" fill="#f7f7f5"/>
+      <circle cx="864" cy="860" r="101" fill="#f7f7f5"/>
+    </g>
+    <g id="layer-3-2">
+      <circle cx="350" cy="350" r="67" fill="#f7f7f5"/>
+      <circle cx="675" cy="350" r="67" fill="#f7f7f5"/>
+      <circle cx="350" cy="675" r="67" fill="#f7f7f5"/>
+      <circle cx="675" cy="675" r="67" fill="#f7f7f5"/>
+    </g>
+  </g>
+</svg>

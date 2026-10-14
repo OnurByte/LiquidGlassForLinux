@@ -35,7 +35,8 @@ Clear, Tinted or preview motion never sends another AI request.
 - Default provider: `codex exec`, reusing your existing Codex login instead of
   requiring OpenAI API credit.
 - Optional Responses API provider with an in-memory, masked API-key field.
-- Default model: `gpt-5.6-luna`, with model selection in the GUI and CLI.
+- Default model: `gpt-5.6-luna`; the GUI accepts any non-empty `codex exec`
+  model string and the CLI passes `--model` through unchanged.
 - One conversion request per icon, cached by source hash and manifest version.
 - One 1024×1024 source document: opaque background, one to four material
   groups, and one to four independent layers inside each group.
@@ -47,17 +48,25 @@ Clear, Tinted or preview motion never sends another AI request.
   one global accent.
 - Batch theme, accent, gradient-preserving background and foreground-opacity
   controls. They are renderer uniforms, never prompt text and never AI work.
+- Automatic local contrast correction keeps low-contrast material surfaces
+  visible; switch it off from the GUI or with `--no-auto-contrast`.
+- Application search filters by name, desktop ID, icon name and category.
 - Per-app layer inspector with local surface color, opacity and co-planar
   normalization controls. White artwork can be recolored (for example, red)
   without rewriting the canonical SVG.
 - Daily-use categories enabled by default. Avahi/SSH server browsers,
   settings, system helpers and terminal entries stay out until you opt in.
 - User-scoped icon installation with standard 16–1024 px Hicolor assets,
+  rendered directly at every installed Hicolor size so dock edge sampling
+  matches the preview,
   cache refresh and a fingerprinted `.desktop` override. The GNOME app grid
   sees an override reinsertion without logout; `/usr/share/applications` is
   not modified.
 - Optional GNOME Shell 50 pointer parallax for managed app icons only. It
-  follows the local managed-icon state instead of moving every shell icon.
+  keeps the outer icon/base fixed, enlarges managed dock icons slightly, and
+  moves only their generated foreground layers instead of the application/grid
+  container.
+- AI conversion runs as a bounded batch with at most 10 concurrent icons.
 - Explicit Stop, a 120-second Codex timeout and no AI work at application
   startup.
 
@@ -111,10 +120,12 @@ The canonical SVG deliberately contains no accent, appearance, blur, glow,
 refraction or permanent shadow. A single converted asset can therefore produce
 many local looks without being regenerated.
 
-When a global background colour is selected, the renderer retains the source
-background's relative light/dark values instead of flattening a source
-gradient. Layer preferences are keyed to the canonical SVG hash, so a future
-reconversion cannot accidentally inherit a colour intended for older artwork.
+When a global background colour is selected, a flat source background becomes
+that exact colour while a source gradient retains its relative light/dark
+values. Low-contrast surfaces are recolored locally from black, white or the
+global accent; explicit per-layer colors win. Layer preferences are keyed to
+the canonical SVG hash, so a future reconversion cannot accidentally inherit a
+colour intended for older artwork.
 
 ## Linux liquid-glass landscape
 
@@ -228,7 +239,8 @@ extension adds cursor parallax only while an icon is visible in the Dash or app
 grid, and only for applications listed in
 `$XDG_DATA_HOME/liquid-glass-icon/managed-icons.json`. It watches that file, so
 newly managed icons join without another extension install. It does not theme
-the panel, dock or unrelated applications.
+the panel, the whole dock, or unrelated applications; only managed icons get
+the small size adjustment and layered motion.
 
 ```bash
 ./scripts/install-gnome-parallax.sh
@@ -236,17 +248,20 @@ the panel, dock or unrelated applications.
 
 The GUI detects `XDG_CURRENT_DESKTOP`: it shows the GNOME install action only
 inside a GNOME session, while inactive desktop rows say they are not in use.
-After a successful install the action becomes **Log out to activate**; GNOME
-still asks for confirmation before ending the session. The installer uses
+The GUI shows **Active** and hides the logout action when GNOME reports the
+extension state as `ACTIVE`; it shows **Installed — log out to activate** only
+when the extension is installed but inactive. The installer uses
 Polkit (`pkexec`), asks for your administrator password, and installs the
 extension system-wide under `/usr/share/gnome-shell/extensions`. The command
 above remains a password-free per-user install. To request the same system
 scope from a terminal, use `./scripts/install-gnome-parallax.sh --system`.
 
-KDE Plasma and Hyprland are detected by the installer and deliberately keep
-the installed icons static. GNOME Shell runs extension code in the Shell
-process; on Wayland, log out and back in once after installing or changing the
-extension source.
+KDE Plasma and Hyprland are detected by the installer and keep the installed
+icons static through the standard XDG application/icon paths. KDE additionally
+refreshes its application cache with `kbuildsycoca6 --noincremental` when
+available; Hyprland needs no separate launcher or shell integration. GNOME
+Shell runs extension code in the Shell process; on Wayland, log out and back
+in once after installing or changing the extension source.
 
 ## Install from GitHub
 
@@ -288,7 +303,10 @@ out/apps/org.gnome.Calculator/
   locally when entries change; this never queues an AI request. Use **Refresh
   applications** to force the same safe rescan immediately.
 - Preview supports pointer parallax and an optional **3D tilt** card response.
-  These are preview-only; installed Hicolor PNGs always render at rest.
+  These are preview-only; installed Hicolor PNGs always render at rest. Both
+  preview and installed PNGs receive the same renderer-owned corner mask.
+- Automatic contrast is local to each rendered surface; it never changes the
+  canonical SVG or spends provider/API credit.
 - Negative space such as Discord's eyes is a real cutout: changing the global
   background reveals the new background there rather than retaining a painted
   copy of the original colour. Older generated SVGs are corrected locally.

@@ -14,6 +14,7 @@ use std::{
 };
 
 const ICON_SIZES: [u32; 11] = [16, 24, 32, 48, 64, 96, 128, 192, 256, 512, 1024];
+const SYSTEM_HICOLOR_INDEX: &str = "/usr/share/icons/hicolor/index.theme";
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
 struct ManagedIcon {
@@ -94,11 +95,11 @@ impl IconInstaller {
         renderer: &mut GlassRenderer,
         settings: RenderSettings,
     ) -> Result<(), IconError> {
+        self.repair_user_icon_theme()?;
         // Resolve the launcher before creating PNGs. Previously this happened
         // afterwards, which left orphan files when an app bundle disappeared.
         let prepared = self.prepare_desktop_override(application)?;
         renderer.load_svg(svg)?;
-        self.ensure_hicolor_theme()?;
         let rendered = ICON_SIZES
             .into_iter()
             .map(|size| {
@@ -107,6 +108,7 @@ impl IconInstaller {
                     .map(|image| (size, image))
             })
             .collect::<Result<Vec<_>, _>>()?;
+        self.write_parallax_assets(application, renderer, settings)?;
         let fingerprint = crate::manifest::sha256(rendered[1].1.as_raw());
         let icon_name = format!(
             "liquid-glass-{}-{}",
@@ -387,6 +389,11 @@ impl IconInstaller {
             let _ = fs::remove_file(path);
         }
         self.remove_icon_family(&application_output_name(&entry.desktop_id), &[]);
+        let _ = fs::remove_dir_all(
+            self.data_home
+                .join("liquid-glass-icon/parallax")
+                .join(application_output_name(&entry.desktop_id)),
+        );
         write_state(&state_path, &state)?;
         refresh_desktop_caches(&self.data_home)?;
         Ok(())
@@ -407,6 +414,28 @@ impl IconInstaller {
         Ok(ids)
     }
 
+    pub fn repair_user_icon_theme(&self) -> Result<(), IconError> {
+        let root = self.data_home.join("icons/hicolor");
+        let index = root.join("index.theme");
+        if let Ok(contents) = fs::read_to_string(&index)
+            && is_legacy_hicolor_index(&contents)
+        {
+            let backup_dir = self.data_home.join("liquid-glass-icon/backups/hicolor");
+            move_to_available_backup(&index, &backup_dir, "index.theme")?;
+            let cache = root.join("icon-theme.cache");
+            if cache.is_file() {
+                move_to_available_backup(&cache, &backup_dir, "icon-theme.cache")?;
+            }
+        }
+
+        if !index.is_file()
+            && let Ok(system_index) = fs::read(SYSTEM_HICOLOR_INDEX)
+        {
+            write_bytes_atomically(&index, &system_index)?;
+        }
+        Ok(())
+    }
+
     fn icon_path(&self, icon_name: &str, size: u32) -> PathBuf {
         self.data_home
             .join("icons/hicolor")
@@ -414,11 +443,37 @@ impl IconInstaller {
             .join(format!("{icon_name}.png"))
     }
 
-    fn ensure_hicolor_theme(&self) -> Result<(), IconError> {
-        let root = self.data_home.join("icons/hicolor");
-        let index = root.join("index.theme");
-        if !index.exists() {
-            write_bytes_atomically(&index, hicolor_index().as_bytes())?;
+    fn write_parallax_assets(
+        &self,
+        application: &DesktopApplication,
+        renderer: &GlassRenderer,
+        settings: RenderSettings,
+    ) -> Result<(), IconError> {
+        let directory = self
+            .data_home
+            .join("liquid-glass-icon/parallax")
+            .join(application_output_name(&application.id));
+        fs::create_dir_all(&directory)?;
+        for entry in fs::read_dir(&directory)?.flatten() {
+            let path = entry.path();
+            if path
+                .file_name()
+                .and_then(|name| name.to_str())
+                .is_some_and(|name| name.starts_with("layer-") && name.ends_with(".png"))
+            {
+                let _ = fs::remove_file(path);
+            }
+        }
+        for layer in 0..renderer.layer_count() {
+            let mut layer_settings = settings;
+            layer_settings.layer = Some(layer);
+            let image = renderer.render(1024, 1024, layer_settings, RenderTarget::ParallaxLayer)?;
+            let name = if layer == 0 {
+                "base.png".to_owned()
+            } else {
+                format!("layer-{layer}.png")
+            };
+            write_png_atomically(&directory.join(name), &image)?;
         }
         Ok(())
     }
@@ -620,7 +675,7 @@ fn replace_desktop_entry_for_refresh(path: &Path, bytes: &[u8]) -> Result<(), Ic
     Ok(())
 }
 
-fn hicolor_index() -> String {
+fn legacy_hicolor_index() -> String {
     let directories = ICON_SIZES
         .iter()
         .map(|size| format!("{size}x{size}/apps"))
@@ -638,13 +693,28 @@ fn hicolor_index() -> String {
     index
 }
 
+fn is_legacy_hicolor_index(contents: &str) -> bool {
+    contents == legacy_hicolor_index()
+}
+
+fn move_to_available_backup(path: &Path, directory: &Path, name: &str) -> Result<(), IconError> {
+    fs::create_dir_all(directory)?;
+    let mut candidate = directory.join(name);
+    let mut index = 0u32;
+    while candidate.exists() {
+        index += 1;
+        candidate = directory.join(format!("{name}.{index}"));
+    }
+    fs::rename(path, candidate)?;
+    Ok(())
+}
+
 fn refresh_desktop_caches(data_home: &Path) -> Result<(), IconError> {
     let icon_root = data_home.join("icons/hicolor");
-    let applications = data_home.join("applications");
-    if icon_root.is_dir() {
+    if icon_root.join("index.theme").is_file() && command_exists("gtk4-update-icon-cache") {
         let status = Command::new("gtk4-update-icon-cache")
             .args(["-q", "-f", "-t"])
-            .arg(icon_root)
+            .arg(&icon_root)
             .status()
             .map_err(IconError::Io)?;
         if !status.success() {
@@ -653,6 +723,7 @@ fn refresh_desktop_caches(data_home: &Path) -> Result<(), IconError> {
             ));
         }
     }
+    let applications = data_home.join("applications");
     let status = Command::new("update-desktop-database")
         .arg("-q")
         .arg(applications)
@@ -663,7 +734,38 @@ fn refresh_desktop_caches(data_home: &Path) -> Result<(), IconError> {
             "update-desktop-database failed".to_owned(),
         ));
     }
+    if is_kde_session() && command_exists("kbuildsycoca6") {
+        let status = Command::new("kbuildsycoca6")
+            .arg("--noincremental")
+            .status()
+            .map_err(IconError::Io)?;
+        if !status.success() {
+            return Err(IconError::Manifest(
+                "kbuildsycoca6 failed to refresh the KDE application cache".to_owned(),
+            ));
+        }
+    }
     Ok(())
+}
+
+fn is_kde_session() -> bool {
+    ["XDG_CURRENT_DESKTOP", "XDG_SESSION_DESKTOP"]
+        .into_iter()
+        .filter_map(|name| std::env::var(name).ok())
+        .any(|value| desktop_value_is_kde(&value))
+}
+
+fn desktop_value_is_kde(value: &str) -> bool {
+    let value = value.to_ascii_lowercase();
+    value.contains("kde") || value.contains("plasma")
+}
+
+fn command_exists(command: &str) -> bool {
+    std::env::var_os("PATH")
+        .into_iter()
+        .flat_map(|path| std::env::split_paths(&path).collect::<Vec<_>>())
+        .map(|directory| directory.join(command))
+        .any(|path| path.is_file())
 }
 
 #[cfg(test)]
@@ -709,5 +811,54 @@ mod tests {
         installer.restore("demo.desktop").unwrap();
         assert!(!override_path.exists());
         assert!(!installer.is_managed("demo.desktop"));
+    }
+
+    #[test]
+    fn kde_detection_accepts_plasma_session_names() {
+        assert!(desktop_value_is_kde("KDE;Plasma"));
+        assert!(desktop_value_is_kde("plasma"));
+        assert!(!desktop_value_is_kde("GNOME"));
+    }
+
+    #[test]
+    fn repair_moves_legacy_theme_metadata_and_cache_to_a_backup() {
+        let root = tempdir().unwrap();
+        let theme = root.path().join("icons/hicolor");
+        fs::create_dir_all(&theme).unwrap();
+        fs::write(theme.join("index.theme"), legacy_hicolor_index()).unwrap();
+        fs::write(theme.join("icon-theme.cache"), b"cache").unwrap();
+
+        IconInstaller::with_data_home_for_test(root.path().to_owned())
+            .repair_user_icon_theme()
+            .unwrap();
+
+        let backup = root.path().join("liquid-glass-icon/backups/hicolor");
+        assert_eq!(
+            fs::read(theme.join("index.theme")).unwrap(),
+            fs::read(SYSTEM_HICOLOR_INDEX).unwrap()
+        );
+        assert!(!theme.join("icon-theme.cache").exists());
+        assert_eq!(
+            fs::read(backup.join("index.theme")).unwrap(),
+            legacy_hicolor_index().as_bytes()
+        );
+        assert_eq!(fs::read(backup.join("icon-theme.cache")).unwrap(), b"cache");
+    }
+
+    #[test]
+    fn repair_leaves_non_legacy_theme_metadata_alone() {
+        let root = tempdir().unwrap();
+        let index = root.path().join("icons/hicolor/index.theme");
+        fs::create_dir_all(index.parent().unwrap()).unwrap();
+        fs::write(&index, "[Icon Theme]\nName=Hicolor\n").unwrap();
+
+        IconInstaller::with_data_home_for_test(root.path().to_owned())
+            .repair_user_icon_theme()
+            .unwrap();
+
+        assert_eq!(
+            fs::read_to_string(index).unwrap(),
+            "[Icon Theme]\nName=Hicolor\n"
+        );
     }
 }

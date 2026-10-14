@@ -18,12 +18,15 @@ const MAX_TEXTURE_LAYERS: u32 = MAX_SURFACES as u32 + 1;
 
 /// Bumped whenever composition or material behavior changes so cached icons
 /// are rebuilt from their canonical SVGs without another AI request.
-pub const RENDERER_REVISION: u32 = 9;
+pub const RENDERER_REVISION: u32 = 10;
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum RenderTarget {
     Preview,
     Icon,
+    /// Transparent layer output used by the GNOME Shell compositor. The
+    /// enclosure/background stays fixed while foreground material layers move.
+    ParallaxLayer,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -33,6 +36,9 @@ pub struct RenderSettings {
     /// Global multiplier for every material surface, independent from the
     /// opaque source background.
     pub foreground_opacity: f32,
+    /// Recolor low-contrast material surfaces locally so the icon remains
+    /// visible after a background override.
+    pub auto_contrast: bool,
     /// Replaces only the source colour field at runtime; the canonical SVG
     /// remains the portable source of truth.
     pub background: Option<[u8; 3]>,
@@ -78,6 +84,7 @@ impl Default for RenderSettings {
             appearance: Appearance::Default,
             accent: [137, 180, 250],
             foreground_opacity: 1.0,
+            auto_contrast: true,
             background: None,
             surface_overrides: [SurfaceOverride {
                 color: None,
@@ -200,7 +207,12 @@ impl GlassRenderer {
         self.queue.write_buffer(
             &icon.uniform,
             0,
-            &f32_bytes(&settings.params(target, &icon.surface_settings, icon.background_luminance)),
+            &f32_bytes(&settings.params(
+                target,
+                &icon.surface_settings,
+                icon.background_luminance,
+                icon.background_is_flat,
+            )),
         );
 
         let mut encoder = self
@@ -279,9 +291,10 @@ impl GlassRenderer {
         readback.unmap();
         let mut image = RgbaImage::from_raw(width, height, pixels)
             .ok_or_else(|| gpu_error("GPU returned an invalid RGBA image"))?;
-        if target == RenderTarget::Icon {
-            apply_canonical_mask(&mut image);
-        }
+        // Preview and exported PNGs must own the same enclosure geometry.
+        // Keeping this at the renderer boundary prevents the GTK preview and
+        // icon installer from drifting into two different border radii.
+        apply_canonical_mask(&mut image);
         Ok(image)
     }
 }
@@ -312,7 +325,7 @@ fn mask_value(distance: f32) -> f32 {
 }
 
 /// Apply the canonical icon mask exactly once. Layer textures are never
-/// masked; only the final exported image is.
+/// masked; only the final preview/export image is.
 pub fn apply_canonical_mask(image: &mut RgbaImage) {
     let width = image.width() as f32;
     let height = image.height() as f32;
@@ -410,6 +423,7 @@ struct GlassIcon {
     surface_settings: Vec<SurfaceSettings>,
     surface_labels: Vec<String>,
     background_luminance: f32,
+    background_is_flat: bool,
 }
 
 #[derive(Debug, Clone, Copy)]
@@ -541,6 +555,7 @@ impl GlassIcon {
                 .map(|surface| surface.label.clone())
                 .collect(),
             background_luminance: average_linear_luminance(&document.background),
+            background_is_flat: background_is_flat(&document.background),
         }
     }
 }
@@ -551,6 +566,7 @@ impl RenderSettings {
         target: RenderTarget,
         surfaces: &[SurfaceSettings],
         background_luminance: f32,
+        background_is_flat: bool,
     ) -> Vec<f32> {
         let [r, g, b] = self.accent.map(|channel| f32::from(channel) / 255.0);
         let pointer = if target == RenderTarget::Icon {
@@ -588,9 +604,13 @@ impl RenderSettings {
             background_b,
             if self.background.is_some() { 1.0 } else { 0.0 },
             background_luminance.max(0.0001),
-            0.0,
-            0.0,
-            0.0,
+            if background_is_flat { 1.0 } else { 0.0 },
+            if self.auto_contrast { 1.0 } else { 0.0 },
+            if target == RenderTarget::ParallaxLayer {
+                1.0
+            } else {
+                0.0
+            },
         ];
 
         let mut material_values = Vec::with_capacity(MAX_SURFACES * 4);
@@ -672,6 +692,22 @@ fn average_linear_luminance(image: &RgbaImage) -> f32 {
         weight += alpha;
     }
     (total / weight.max(1.0)).max(0.0001)
+}
+
+fn background_is_flat(image: &RgbaImage) -> bool {
+    let mut minimum: f32 = 1.0;
+    let mut maximum: f32 = 0.0;
+    for pixel in image.pixels() {
+        if pixel[3] == 0 {
+            continue;
+        }
+        let luminance = 0.2126 * srgb_channel_to_linear(pixel[0])
+            + 0.7152 * srgb_channel_to_linear(pixel[1])
+            + 0.0722 * srgb_channel_to_linear(pixel[2]);
+        minimum = minimum.min(luminance);
+        maximum = maximum.max(luminance);
+    }
+    maximum - minimum < 0.02
 }
 
 fn specular_index(mode: SpecularMode) -> f32 {
@@ -952,16 +988,71 @@ fn preview_background(uv: vec2<f32>) -> vec3<f32> {
 fn source_background_color(uv: vec2<f32>) -> vec3<f32> {
     let source = textureSample(layers, layer_sampler, uv, 0);
     if params.background.a < 0.5 { return source.rgb; }
+    if params.background_reference.y > 0.5 { return params.background.rgb; }
     let source_luma = dot(source.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
     let shade = clamp(source_luma / params.background_reference.x, 0.18, 2.75);
     return clamp(params.background.rgb * shade, vec3<f32>(0.0), vec3<f32>(1.0));
 }
 
-fn source_with_surface_override(source: vec4<f32>, setting: vec4<f32>) -> vec4<f32> {
+fn color_luminance(color: vec3<f32>) -> f32 {
+    return dot(color, vec3<f32>(0.2126, 0.7152, 0.0722));
+}
+
+fn contrast_ratio(first: f32, second: f32) -> f32 {
+    let light = max(first, second);
+    let dark = min(first, second);
+    return (light + 0.05) / (dark + 0.05);
+}
+
+fn best_contrast_color(background: f32) -> vec3<f32> {
+    let white = vec3<f32>(1.0);
+    let black = vec3<f32>(0.0);
+    let accent = params.accent.rgb;
+    var selected = white;
+    var score = contrast_ratio(background, color_luminance(white));
+    let black_score = contrast_ratio(background, color_luminance(black));
+    if black_score > score {
+        selected = black;
+        score = black_score;
+    }
+    if contrast_ratio(background, color_luminance(accent)) > score {
+        selected = accent;
+    }
+    return selected;
+}
+
+fn source_with_surface_override(
+    source: vec4<f32>,
+    setting: vec4<f32>,
+) -> vec4<f32> {
     if setting.x < 0.0 { return vec4<f32>(source.rgb, source.a * setting.w); }
     let source_luma = dot(source.rgb, vec3<f32>(0.2126, 0.7152, 0.0722));
     let target_luma = max(dot(setting.rgb, vec3<f32>(0.2126, 0.7152, 0.0722)), 0.0001);
     let recolored = clamp(setting.rgb * (source_luma / target_luma), vec3<f32>(0.0), vec3<f32>(1.0));
+    return vec4<f32>(recolored, source.a * setting.w);
+}
+
+fn source_with_auto_contrast(
+    source: vec4<f32>,
+    setting: vec4<f32>,
+    background: vec3<f32>,
+) -> vec4<f32> {
+    let manual = source_with_surface_override(source, setting);
+    if setting.x >= 0.0 || params.background_reference.z < 0.5 {
+        return manual;
+    }
+    let background_luma = color_luminance(background);
+    let source_luma = color_luminance(source.rgb);
+    if contrast_ratio(background_luma, source_luma) >= 2.0 {
+        return manual;
+    }
+    let contrast_color = best_contrast_color(background_luma);
+    let target_luma = max(color_luminance(contrast_color), 0.0001);
+    let recolored = clamp(
+        contrast_color * (max(source_luma, 0.18) / target_luma),
+        vec3<f32>(0.0),
+        vec3<f32>(1.0),
+    );
     return vec4<f32>(recolored, source.a * setting.w);
 }
 
@@ -985,7 +1076,14 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         if selected_index == 0 {
             return vec4(source_background_color(uv), 1.0);
         }
-        selected = source_with_surface_override(selected, params.surface_override[u32(selected_index - 1)]);
+        selected = source_with_auto_contrast(
+            selected,
+            params.surface_override[u32(selected_index - 1)],
+            source_background_color(uv),
+        );
+        if params.background_reference.w > 0.5 {
+            return selected;
+        }
         return vec4(mix(environment, selected.rgb, selected.a), 1.0);
     }
 
@@ -1002,9 +1100,10 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         let z = depth_plane / foreground_count;
         let parallax = params.pointer.xy * z * 0.036;
         let sample_uv = uv + parallax;
-        let source = source_with_surface_override(
+        let source = source_with_auto_contrast(
             textureSample(layers, layer_sampler, sample_uv, index),
             params.surface_override[surface_index],
+            source_background_color(sample_uv),
         );
         var source_alpha = source.a;
         var effects_enabled = material_settings.x > 0.5;
@@ -1056,9 +1155,10 @@ fn fs_main(input: VertexOut) -> @location(0) vec4<f32> {
         var behind = source_background_color(refracted_uv);
         for (var behind_index: i32 = 1; behind_index < 17; behind_index = behind_index + 1) {
             if behind_index >= index { break; }
-            let behind_layer = source_with_surface_override(
+            let behind_layer = source_with_auto_contrast(
                 textureSample(layers, layer_sampler, refracted_uv, behind_index),
                 params.surface_override[u32(behind_index - 1)],
+                source_background_color(refracted_uv),
             );
             behind = mix(behind, behind_layer.rgb, behind_layer.a);
         }
@@ -1460,6 +1560,13 @@ mod legacy_safe_zone_tests {
         assert_eq!(image.get_pixel(0, 127)[3], 0);
         assert_eq!(image.get_pixel(127, 127)[3], 0);
 
+        let preview = renderer
+            .render(128, 128, RenderSettings::default(), RenderTarget::Preview)
+            .unwrap();
+        for (icon_pixel, preview_pixel) in image.pixels().zip(preview.pixels()) {
+            assert_eq!(icon_pixel[3], preview_pixel[3]);
+        }
+
         let selected = renderer
             .render(
                 128,
@@ -1601,6 +1708,11 @@ mod tests {
 <g id="group-1"><g id="layer-1-1"><circle cx="512" cy="512" r="140" fill="#ffffff"/></g></g>
 </svg>"##;
 
+    const FLAT_DARK_SVG: &str = r##"<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+<g id="background"><rect width="1024" height="1024" fill="#080808"/></g>
+<g id="group-1"><g id="layer-1-1"><circle cx="512" cy="512" r="220" fill="#101010"/></g></g>
+</svg>"##;
+
     #[test]
     fn canonical_layers_keep_the_source_grid() {
         let layers = prepare_canonical_layers(LEGACY_SVG).unwrap();
@@ -1658,12 +1770,12 @@ mod tests {
             foreground_opacity: -2.0,
             ..RenderSettings::default()
         }
-        .params(RenderTarget::Icon, &[], 1.0);
+        .params(RenderTarget::Icon, &[], 1.0, true);
         let vivid = RenderSettings {
             foreground_opacity: 3.0,
             ..RenderSettings::default()
         }
-        .params(RenderTarget::Icon, &[], 1.0);
+        .params(RenderTarget::Icon, &[], 1.0, true);
         assert_eq!(faint[3], 0.20);
         assert_eq!(vivid[3], 1.50);
     }
@@ -1715,7 +1827,7 @@ mod tests {
             ],
             ..RenderSettings::default()
         }
-        .params(RenderTarget::Icon, &[first, second], 0.5);
+        .params(RenderTarget::Icon, &[first, second], 0.5, false);
         const BASE: usize = 20;
         assert_eq!(settings[BASE + 2], 0.2);
         assert_eq!(settings[BASE + 4 + 2], 0.8);
@@ -1791,6 +1903,62 @@ mod tests {
         let override_pixel = overridden.get_pixel(64, 20);
         assert!(override_pixel[0] > override_pixel[1] + 40);
         assert_ne!(source_pixel, override_pixel);
+    }
+
+    #[tokio::test]
+    async fn default_appearance_applies_a_flat_background_override() {
+        let Ok(mut renderer) = GlassRenderer::new().await else {
+            return;
+        };
+        renderer.load_svg(FLAT_DARK_SVG).unwrap();
+        let image = renderer
+            .render(
+                128,
+                128,
+                RenderSettings {
+                    appearance: Appearance::Default,
+                    background: Some([232, 48, 70]),
+                    auto_contrast: false,
+                    ..RenderSettings::default()
+                },
+                RenderTarget::Icon,
+            )
+            .unwrap();
+        let pixel = image.get_pixel(64, 20);
+        assert!(
+            pixel[0] > pixel[1] + 40,
+            "background override was ignored: {pixel:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auto_contrast_recolors_a_low_contrast_surface() {
+        let Ok(mut renderer) = GlassRenderer::new().await else {
+            return;
+        };
+        renderer.load_svg(FLAT_DARK_SVG).unwrap();
+        let without = renderer
+            .render(
+                128,
+                128,
+                RenderSettings {
+                    auto_contrast: false,
+                    ..RenderSettings::default()
+                },
+                RenderTarget::Icon,
+            )
+            .unwrap();
+        let with = renderer
+            .render(128, 128, RenderSettings::default(), RenderTarget::Icon)
+            .unwrap();
+        let without_pixel = without.get_pixel(64, 64);
+        let with_pixel = with.get_pixel(64, 64);
+        assert_ne!(without_pixel, with_pixel);
+        let without_luma =
+            u16::from(without_pixel[0]) + u16::from(without_pixel[1]) + u16::from(without_pixel[2]);
+        let with_luma =
+            u16::from(with_pixel[0]) + u16::from(with_pixel[1]) + u16::from(with_pixel[2]);
+        assert!(with_luma > without_luma);
     }
 
     #[tokio::test]

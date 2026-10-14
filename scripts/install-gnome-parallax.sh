@@ -45,6 +45,12 @@ if [ "$system_scope" = true ]; then
     }
     # The GUI invokes this mode so Polkit presents the desktop password prompt.
     pkexec "$script_path" --install-system "$project_dir"
+    # GNOME prefers a user extension over the system copy. Refresh an existing
+    # user install too, otherwise the active shell can keep running old code.
+    if [ -d "$extension_dir" ]; then
+        install -m 0644 "$project_dir/extensions/liquid-glass-parallax@onurbyte/metadata.json" "$extension_dir/metadata.json"
+        install -m 0644 "$project_dir/extensions/liquid-glass-parallax@onurbyte/extension.js" "$extension_dir/extension.js"
+    fi
     extension_dir="/usr/share/gnome-shell/extensions/$extension_uuid"
 else
     mkdir -p "$extension_dir"
@@ -52,6 +58,11 @@ else
     install -m 0644 "$project_dir/extensions/liquid-glass-parallax@onurbyte/extension.js" "$extension_dir/extension.js"
 fi
 
+# Reload an already-active copy so a source update takes effect in this
+# session; otherwise GNOME keeps the old JavaScript module in memory.
+if gnome-extensions info "$extension_uuid" 2>/dev/null | grep -q 'State: ACTIVE'; then
+    gnome-extensions disable "$extension_uuid"
+fi
 if gnome-extensions enable "$extension_uuid" 2>/dev/null; then
     gnome-extensions info "$extension_uuid"
     exit 0

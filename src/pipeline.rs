@@ -9,7 +9,7 @@ use crate::{
     svg::{validate_icon_document, validate_svg, validate_svg_structure},
 };
 use std::{
-    collections::HashSet,
+    collections::{HashSet, VecDeque},
     fs,
     path::{Path, PathBuf},
     sync::{
@@ -17,6 +17,16 @@ use std::{
         atomic::{AtomicBool, Ordering},
     },
 };
+use tokio::task::JoinSet;
+
+pub const MAX_CONCURRENT_CONVERSIONS: usize = 10;
+
+struct PendingConversion {
+    application: DesktopApplication,
+    input: IconInput,
+    output_dir: PathBuf,
+    icon_path: PathBuf,
+}
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum CacheStatus {
@@ -159,6 +169,7 @@ where
     F: FnMut(DesktopTaskEvent),
 {
     let mut results = Vec::new();
+    let mut pending = VecDeque::new();
     for (index, application) in applications.iter().enumerate() {
         if cancelled.load(Ordering::Relaxed) {
             for application in &applications[index..] {
@@ -228,30 +239,75 @@ where
             }
         }
         report(event(application, DesktopTaskState::Queued, "queued", None));
-        report(event(
-            application,
-            DesktopTaskState::Processing,
-            format!("processing {}", icon_path.display()),
-            None,
-        ));
-        let result = transform_icon(
-            TransformRequest {
+        pending.push_back(PendingConversion {
+            application: application.clone(),
+            input,
+            output_dir: application_output,
+            icon_path: icon_path.clone(),
+        });
+    }
+
+    let mut active = JoinSet::new();
+    loop {
+        while active.len() < MAX_CONCURRENT_CONVERSIONS
+            && !cancelled.load(Ordering::Relaxed)
+            && !pending.is_empty()
+        {
+            let job = pending.pop_front().expect("pending conversion exists");
+            report(event(
+                &job.application,
+                DesktopTaskState::Processing,
+                format!("processing {}", job.icon_path.display()),
+                None,
+            ));
+            let provider = provider.clone();
+            let cancelled = Arc::clone(&cancelled);
+            let PendingConversion {
+                application,
                 input,
-                output_dir: application_output,
-            },
-            provider,
-            Arc::clone(&cancelled),
-        )
-        .await;
+                output_dir,
+                icon_path: _,
+            } = job;
+            active.spawn(async move {
+                let result = transform_icon(
+                    TransformRequest {
+                        input,
+                        output_dir: output_dir.clone(),
+                    },
+                    &provider,
+                    cancelled,
+                )
+                .await;
+                (application, result)
+            });
+        }
+
+        if cancelled.load(Ordering::Relaxed) {
+            for job in pending.drain(..) {
+                report(event(
+                    &job.application,
+                    DesktopTaskState::Stopped,
+                    "stopped by user",
+                    None,
+                ));
+            }
+        }
+
+        let Some(joined) = active.join_next().await else {
+            break;
+        };
+        let Ok((application, result)) = joined else {
+            continue;
+        };
         match result {
             Ok(result) => {
                 let archive_message = asset_dir.map(|asset_dir| {
-                    archive_conversion(asset_dir, application, &result)
+                    archive_conversion(asset_dir, &application, &result)
                         .map(|path| format!(" · archived {}", path.display()))
                         .unwrap_or_else(|error| format!(" · archive skipped: {error}"))
                 });
                 report(event(
-                    application,
+                    &application,
                     DesktopTaskState::Completed,
                     format!(
                         "{}{}",
@@ -264,20 +320,11 @@ where
             }
             Err(IconError::Cancelled) => {
                 report(event(
-                    application,
+                    &application,
                     DesktopTaskState::Stopped,
                     "stopped by user",
                     None,
                 ));
-                for application in &applications[index + 1..] {
-                    report(event(
-                        application,
-                        DesktopTaskState::Stopped,
-                        "stopped by user",
-                        None,
-                    ));
-                }
-                break;
             }
             Err(error) => {
                 let provider_failed = matches!(
@@ -287,21 +334,21 @@ where
                         | IconError::MissingApiKey
                 );
                 report(event(
-                    application,
+                    &application,
                     DesktopTaskState::Failed,
                     error.to_string(),
                     None,
                 ));
                 if provider_failed {
-                    for application in &applications[index + 1..] {
+                    cancelled.store(true, Ordering::Relaxed);
+                    for job in pending.drain(..) {
                         report(event(
-                            application,
+                            &job.application,
                             DesktopTaskState::Stopped,
                             "provider unavailable",
                             None,
                         ));
                     }
-                    break;
                 }
             }
         }

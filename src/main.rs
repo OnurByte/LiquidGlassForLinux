@@ -96,6 +96,8 @@ enum Command {
         #[arg(long, value_name = "PERCENT")]
         foreground_opacity: Option<f32>,
         #[arg(long)]
+        no_auto_contrast: bool,
+        #[arg(long)]
         output: Option<PathBuf>,
     },
     Repair {
@@ -111,6 +113,8 @@ enum Command {
         background: Option<String>,
         #[arg(long, value_name = "PERCENT")]
         foreground_opacity: Option<f32>,
+        #[arg(long)]
+        no_auto_contrast: bool,
         #[arg(long)]
         output: Option<PathBuf>,
     },
@@ -166,6 +170,7 @@ struct RenderOptions<'a> {
     accent: Option<&'a str>,
     background: Option<&'a str>,
     foreground_opacity: Option<f32>,
+    auto_contrast: bool,
     output: Option<&'a Path>,
 }
 
@@ -173,6 +178,7 @@ impl RenderOptions<'_> {
     fn settings(self) -> anyhow::Result<RenderSettings> {
         let mut settings = RenderSettings {
             appearance: self.appearance.into(),
+            auto_contrast: self.auto_contrast,
             ..Default::default()
         };
         if let Some(accent) = self.accent {
@@ -239,6 +245,7 @@ async fn main() -> anyhow::Result<()> {
             accent,
             background,
             foreground_opacity,
+            no_auto_contrast,
             output,
         } => {
             let render = RenderOptions {
@@ -246,6 +253,7 @@ async fn main() -> anyhow::Result<()> {
                 accent: accent.as_deref(),
                 background: background.as_deref(),
                 foreground_opacity,
+                auto_contrast: !no_auto_contrast,
                 output: output.as_deref(),
             };
             apply(desktop_id, managed, render, args.json).await
@@ -258,6 +266,7 @@ async fn main() -> anyhow::Result<()> {
             accent,
             background,
             foreground_opacity,
+            no_auto_contrast,
             output,
         } => {
             let render = RenderOptions {
@@ -265,6 +274,7 @@ async fn main() -> anyhow::Result<()> {
                 accent: accent.as_deref(),
                 background: background.as_deref(),
                 foreground_opacity,
+                auto_contrast: !no_auto_contrast,
                 output: output.as_deref(),
             };
             repair(desktop_id, managed, render, args.json).await
@@ -634,6 +644,7 @@ mod tests {
             "263447",
             "--foreground-opacity",
             "75",
+            "--no-auto-contrast",
         ])
         .unwrap();
         assert!(matches!(
@@ -641,8 +652,11 @@ mod tests {
             Command::Apply {
                 background: Some(background),
                 foreground_opacity: Some(foreground_opacity),
+                no_auto_contrast,
                 ..
-            } if background == "263447" && foreground_opacity == 75.0
+            } if background == "263447"
+                && foreground_opacity == 75.0
+                && no_auto_contrast
         ));
         assert_eq!(parse_accent("#89b4fa").unwrap(), [137, 180, 250]);
         assert!(parse_accent("89b4f").is_err());
