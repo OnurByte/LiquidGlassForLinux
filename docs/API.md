@@ -11,11 +11,11 @@ liquid-glass-icon convert --desktop-id ID... [--provider codex|api]
                          [--model MODEL] [--output PATH] [--json]
 liquid-glass-icon apply (--desktop-id ID... | --managed)
                        [--appearance APPEARANCE] [--accent RRGGBB] [--background RRGGBB]
-                       [--foreground-opacity PERCENT]
+                       [--foreground-opacity PERCENT] [--no-auto-contrast]
                        [--output PATH] [--json]
 liquid-glass-icon repair (--desktop-id ID... | --managed)
                         [--appearance APPEARANCE] [--accent RRGGBB] [--background RRGGBB]
-                        [--foreground-opacity PERCENT]
+                        [--foreground-opacity PERCENT] [--no-auto-contrast]
                         [--output PATH] [--json]
 liquid-glass-icon archive [--desktop-id ID]... [--output PATH]
                           [--asset-dir PATH] [--json]
@@ -27,19 +27,35 @@ being normalized or matched by prefix.
 
 `convert` is the only command that may contact an AI provider. `codex` uses the
 current Codex CLI login. `api` reads `OPENAI_API_KEY`; keys are never accepted
-as arguments. Every requested conversion is explicit and forced. Provider,
-authentication or billing failures stop the remaining batch.
+as arguments. Every requested conversion is explicit and forced. At most ten
+conversions run concurrently. Provider, authentication or billing failures
+stop the remaining batch; ordinary per-icon validation failures are reported
+for that icon while the other queued icons continue.
 
 `apply` only renders an existing current SVG cache and installs standard
-16–1024 px user-scoped Hicolor PNGs plus a user `.desktop` override. It creates
-the Hicolor metadata when absent, refreshes icon/desktop caches and reinserts
-an existing override so the GNOME application grid observes the new
-fingerprinted icon without logout. Appearance and accent changes do not call
-an AI provider. `restore` refuses to overwrite a managed desktop file that the
-user changed after installation.
+16–1024 px user-scoped Hicolor PNGs plus a user `.desktop` override. It renders
+every installed Hicolor size directly so the dock and preview share the same
+edge sampling. It also writes separate 1024 px base/layer assets for the
+optional GNOME Shell compositor. It does not create a partial user Hicolor theme that could shadow the system
+theme; an old Liquid Glass-generated index/cache is moved to a recoverable
+backup. It refreshes desktop caches and
+reinserts an existing override so XDG application monitors observe the new
+fingerprinted icon without logout. In KDE/Plasma sessions it also runs
+`kbuildsycoca6 --noincremental` when that native cache tool is installed;
+Hyprland uses the same standard XDG paths and needs no shell adapter.
+Appearance, accent and automatic contrast changes do not call an AI provider.
+`restore` refuses to overwrite a managed desktop file that the user changed
+after installation.
 
 `--background RRGGBB` replaces the source background colour at render time for
-the selected batch. It does not modify the canonical SVG or send an AI request.
+the selected batch. A flat source background becomes the exact requested
+colour; a source gradient keeps its relative light/dark contrast. It does not
+modify the canonical SVG or send an AI request.
+
+Automatic contrast is enabled by default. When a material surface would blend
+into its local background, the renderer chooses the best of black, white and
+the global accent for that surface only. Manual layer colours always win.
+`--no-auto-contrast` disables this local fallback for `apply` or `repair`.
 
 `--foreground-opacity PERCENT` accepts 20 through 150 and changes only the
 material/foreground surfaces. The opaque background and canonical SVG are left

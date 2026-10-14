@@ -11,10 +11,7 @@ use liquid_glass_icon::{
     icon_install::IconInstaller,
     openai::{CodexExecProvider, DEFAULT_MODEL, OpenAiResponsesClient, SvgProvider},
     pipeline::{CacheStatus, cache_status, transform_desktop_icons_with_options_and_assets},
-    renderer::{
-        GlassRenderer, MAX_SURFACES, RenderSettings, RenderTarget, SurfaceOverride,
-        apply_canonical_mask,
-    },
+    renderer::{GlassRenderer, MAX_SURFACES, RenderSettings, RenderTarget, SurfaceOverride},
     repository_assets_dir,
 };
 use serde::{Deserialize, Serialize};
@@ -34,7 +31,6 @@ use std::{
 };
 
 const APPLICATION_ID: &str = "io.github.yargc.LiquidGlassIcons";
-const MODEL_OPTIONS: [&str; 4] = ["gpt-5.6-luna", "gpt-5.6-terra", "gpt-5.6-sol", "gpt-5.4"];
 const GNOME_PARALLAX_UUID: &str = "liquid-glass-parallax@onurbyte.github.io";
 
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -62,11 +58,30 @@ fn current_desktop_environment() -> DesktopEnvironment {
     desktop_environment(std::env::var("XDG_CURRENT_DESKTOP").ok().as_deref())
 }
 
-fn gnome_parallax_installed() -> bool {
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum GnomeParallaxState {
+    Missing,
+    Installed,
+    Active,
+}
+
+fn gnome_parallax_state() -> GnomeParallaxState {
+    let info = Command::new("gnome-extensions")
+        .args(["info", GNOME_PARALLAX_UUID])
+        .output()
+        .ok();
+    if let Some(output) = info.filter(|output| output.status.success()) {
+        let text = String::from_utf8_lossy(&output.stdout);
+        if text.lines().any(|line| line.trim() == "State: ACTIVE") {
+            return GnomeParallaxState::Active;
+        }
+        return GnomeParallaxState::Installed;
+    }
+
     let user_data = std::env::var_os("XDG_DATA_HOME")
         .map(PathBuf::from)
         .or_else(|| std::env::var_os("HOME").map(|home| PathBuf::from(home).join(".local/share")));
-    user_data
+    let installed = user_data
         .into_iter()
         .map(|data| {
             data.join("gnome-shell/extensions")
@@ -78,7 +93,12 @@ fn gnome_parallax_installed() -> bool {
                 .join(GNOME_PARALLAX_UUID)
                 .join("metadata.json"),
         ))
-        .any(|path| path.is_file())
+        .any(|path| path.is_file());
+    if installed {
+        GnomeParallaxState::Installed
+    } else {
+        GnomeParallaxState::Missing
+    }
 }
 
 fn inactive_desktop_message(
@@ -221,6 +241,8 @@ struct SavedSettings {
     background: Option<[u8; 3]>,
     #[serde(default = "default_foreground_opacity")]
     foreground_opacity: f32,
+    #[serde(default = "default_auto_contrast")]
+    auto_contrast: bool,
     #[serde(default = "default_tilt")]
     tilt: bool,
     #[serde(default)]
@@ -246,6 +268,7 @@ impl Default for SavedSettings {
             accent: default_accent(),
             background: None,
             foreground_opacity: default_foreground_opacity(),
+            auto_contrast: default_auto_contrast(),
             tilt: true,
             blocked_categories: AppCategory::ALL
                 .into_iter()
@@ -266,6 +289,7 @@ struct IconApp {
     accent: [u8; 3],
     background: Option<[u8; 3]>,
     foreground_opacity: f32,
+    auto_contrast: bool,
     tilt: bool,
     api_key: String,
     blocked_categories: HashSet<AppCategory>,
@@ -284,6 +308,7 @@ struct IconApp {
     receiver: Option<Receiver<DesktopTaskEvent>>,
     cancelled: Arc<AtomicBool>,
     selected: Option<usize>,
+    query: String,
     list_dirty: bool,
     glass: GlassRenderer,
     installer: IconInstaller,
@@ -301,6 +326,10 @@ impl IconApp {
         let saved = load_settings();
         let applications = discover_desktop_applications();
         let output = default_output_dir();
+        let installer = IconInstaller::default();
+        installer
+            .repair_user_icon_theme()
+            .map_err(|error| format!("icon theme migration failed: {error}"))?;
         let tasks = applications
             .iter()
             .map(|application| initial_task(application, &output))
@@ -317,6 +346,7 @@ impl IconApp {
             accent: saved.accent,
             background: saved.background,
             foreground_opacity: saved.foreground_opacity.clamp(0.20, 1.50),
+            auto_contrast: saved.auto_contrast,
             tilt: saved.tilt,
             api_key: std::env::var("OPENAI_API_KEY").unwrap_or_default(),
             blocked_categories: saved.blocked_categories,
@@ -335,9 +365,10 @@ impl IconApp {
             receiver: None,
             cancelled: Arc::new(AtomicBool::new(false)),
             selected: None,
+            query: String::new(),
             list_dirty: true,
             glass: renderer,
-            installer: IconInstaller::default(),
+            installer,
             style_manager,
             source_monitors: Vec::new(),
         };
@@ -349,6 +380,10 @@ impl IconApp {
         !self
             .blocked_categories
             .contains(&self.applications[index].category)
+    }
+
+    fn matches_query(&self, index: usize) -> bool {
+        application_matches_query(&self.applications[index], &self.query)
     }
 
     fn refresh_applications(&mut self) {
@@ -388,7 +423,7 @@ impl IconApp {
             Ok(output) if output.status.success() => {
                 let message = String::from_utf8_lossy(&output.stdout);
                 self.status.set_text(message.trim());
-                gnome_parallax_installed()
+                !matches!(gnome_parallax_state(), GnomeParallaxState::Missing)
             }
             Ok(output) => {
                 let message = String::from_utf8_lossy(&output.stderr);
@@ -409,6 +444,7 @@ impl IconApp {
             appearance: self.appearance,
             accent: self.accent,
             foreground_opacity: self.foreground_opacity,
+            auto_contrast: self.auto_contrast,
             background: self.background,
             surface_overrides: self.surface_overrides_for(desktop_id, svg),
             dark_background: self.style_manager.is_dark(),
@@ -512,7 +548,7 @@ impl IconApp {
         }
         let mut visible_count = 0;
         for index in 0..app.applications.len() {
-            if !app.visible(index) {
+            if !app.visible(index) || !app.matches_query(index) {
                 continue;
             }
             visible_count += 1;
@@ -597,10 +633,7 @@ impl IconApp {
             .render(520, 520, self.preview_settings(), RenderTarget::Preview)
             .map_err(|error| error.to_string())
         {
-            Ok(mut image) => {
-                // The shader no longer masks output alpha; every preview view
-                // (composite and single layers) gets the one canonical mask.
-                apply_canonical_mask(&mut image);
+            Ok(image) => {
                 self.set_preview(image);
             }
             Err(error) => {
@@ -838,6 +871,7 @@ impl IconApp {
             accent: self.accent,
             background: self.background,
             foreground_opacity: self.foreground_opacity,
+            auto_contrast: self.auto_contrast,
             tilt: self.tilt,
             blocked_categories: self.blocked_categories.clone(),
             layer_overrides: self.layer_overrides.clone(),
@@ -1084,7 +1118,8 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     count.add_css_class("counter");
 
     let provider = gtk::DropDown::from_strings(&["Codex exec", "API key"]);
-    let model = gtk::DropDown::from_strings(&MODEL_OPTIONS);
+    let model = gtk::Entry::new();
+    model.set_placeholder_text(Some("Codex model, e.g. gpt-5.6-luna"));
     let api_key = gtk::PasswordEntry::new();
     api_key.set_placeholder_text(Some("OpenAI API key"));
     api_key.set_hexpand(false);
@@ -1124,6 +1159,10 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     foreground_opacity.set_tooltip_text(Some(
         "Opacity for every material layer; background and canonical SVG stay unchanged",
     ));
+    let auto_contrast = gtk::Switch::new();
+    auto_contrast.set_tooltip_text(Some(
+        "Recolor only low-contrast foreground surfaces locally; manual layer colors win",
+    ));
     let layer_color_dialog = gtk::ColorDialog::new();
     layer_color_dialog.set_with_alpha(false);
     let layer_color = gtk::ColorDialogButton::new(Some(layer_color_dialog));
@@ -1143,7 +1182,7 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
         } else {
             0
         });
-        model.set_selected(model_index(&app.model));
+        model.set_text(&app.model);
         theme.set_selected(theme_index(app.theme));
         appearance.set_selected(appearance_index(app.appearance));
         tilt.set_active(app.tilt);
@@ -1161,6 +1200,7 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
             1.0,
         ));
         foreground_opacity.set_value(f64::from(app.foreground_opacity) * 100.0);
+        auto_contrast.set_active(app.auto_contrast);
         api_key.set_visible(app.provider_choice == ProviderChoice::Api);
     }
 
@@ -1194,11 +1234,11 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     categories.set_popover(Some(&category_popover));
 
     provider.set_hexpand(true);
-    model.set_hexpand(true);
     api_key.set_hexpand(true);
     theme.set_hexpand(true);
     appearance.set_hexpand(true);
     foreground_opacity.set_hexpand(true);
+    model.set_hexpand(true);
 
     let controls = gtk::Box::new(gtk::Orientation::Vertical, 12);
     controls.add_css_class("card");
@@ -1240,6 +1280,8 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     settings_grid.attach(&tilt, 5, 1, 1, 1);
     settings_grid.attach(&field_label("Foreground opacity"), 0, 2, 1, 1);
     settings_grid.attach(&foreground_opacity, 1, 2, 2, 1);
+    settings_grid.attach(&field_label("Auto contrast"), 4, 2, 1, 1);
+    settings_grid.attach(&auto_contrast, 5, 2, 1, 1);
     settings.append(&settings_grid);
 
     let integrations = gtk::Box::new(gtk::Orientation::Vertical, 10);
@@ -1261,14 +1303,18 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     gnome_action.append(&gnome_installed);
     gnome_action.append(&gnome_logout);
     let gnome_active = desktop == DesktopEnvironment::Gnome;
-    let extension_installed = gnome_active && gnome_parallax_installed();
-    gnome_install.set_visible(gnome_active && !extension_installed);
-    gnome_installed.set_text(if extension_installed {
-        "Installed"
+    let extension_state = if gnome_active {
+        gnome_parallax_state()
     } else {
-        inactive_desktop_message(desktop, DesktopEnvironment::Gnome)
+        GnomeParallaxState::Missing
+    };
+    gnome_install.set_visible(gnome_active && extension_state == GnomeParallaxState::Missing);
+    gnome_installed.set_text(match extension_state {
+        GnomeParallaxState::Active => "Active",
+        GnomeParallaxState::Installed => "Installed — log out to activate",
+        GnomeParallaxState::Missing => inactive_desktop_message(desktop, DesktopEnvironment::Gnome),
     });
-    gnome_logout.set_visible(extension_installed);
+    gnome_logout.set_visible(extension_state == GnomeParallaxState::Installed);
     let integrations_grid = gtk::Grid::new();
     integrations_grid.set_column_spacing(12);
     integrations_grid.set_row_spacing(8);
@@ -1307,6 +1353,10 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
     let list_header = gtk::Box::new(gtk::Orientation::Horizontal, 8);
     list_header.append(&section_label("Applications"));
     list_header.append(&count);
+    let search = gtk::SearchEntry::new();
+    search.set_placeholder_text(Some("Search applications"));
+    search.set_hexpand(true);
+    list_header.append(&search);
     let list_panel = gtk::Box::new(gtk::Orientation::Vertical, 12);
     list_panel.add_css_class("card");
     list_panel.set_vexpand(true);
@@ -1455,9 +1505,19 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
                 .borrow_mut()
                 .install_gnome_parallax()
             {
-                gnome_install_after_success.set_visible(false);
-                gnome_installed_after_success.set_text("Installed");
-                gnome_logout_after_success.set_visible(true);
+                match gnome_parallax_state() {
+                    GnomeParallaxState::Active => {
+                        gnome_install_after_success.set_visible(false);
+                        gnome_installed_after_success.set_text("Active");
+                        gnome_logout_after_success.set_visible(false);
+                    }
+                    GnomeParallaxState::Installed => {
+                        gnome_install_after_success.set_visible(false);
+                        gnome_installed_after_success.set_text("Installed — log out to activate");
+                        gnome_logout_after_success.set_visible(true);
+                    }
+                    GnomeParallaxState::Missing => {}
+                }
             }
         });
         let state_for_gnome_logout = Rc::clone(&state);
@@ -1490,13 +1550,18 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
             state_for_api_key.borrow_mut().api_key = entry.text().to_string();
         });
         let state_for_model = Rc::clone(&state);
-        model.connect_selected_notify(move |dropdown| {
+        model.connect_changed(move |entry| {
             let mut app = state_for_model.borrow_mut();
-            app.model = MODEL_OPTIONS
-                .get(dropdown.selected() as usize)
-                .unwrap_or(&DEFAULT_MODEL)
-                .to_string();
+            app.model = normalize_model(entry.text().to_string());
             app.save();
+        });
+        let state_for_search = Rc::clone(&state);
+        search.connect_search_changed(move |entry| {
+            let mut app = state_for_search.borrow_mut();
+            app.query = entry.text().to_string();
+            app.list_dirty = true;
+            drop(app);
+            IconApp::rebuild_list(&state_for_search);
         });
         let state_for_preview = Rc::clone(&state);
         let preview_selector_updating = state.borrow().preview_selector_updating.clone();
@@ -1582,6 +1647,16 @@ fn build_window(application: &Application, state: Rc<RefCell<IconApp>>) {
                 &state_for_foreground_opacity,
                 &reapply_for_foreground_opacity,
             );
+        });
+        let state_for_auto_contrast = Rc::clone(&state);
+        let reapply_for_auto_contrast = Rc::clone(&reapply_generation);
+        auto_contrast.connect_active_notify(move |toggle| {
+            {
+                let mut app = state_for_auto_contrast.borrow_mut();
+                app.auto_contrast = toggle.is_active();
+                app.save();
+            }
+            schedule_reapply(&state_for_auto_contrast, &reapply_for_auto_contrast);
         });
         let state_for_layer_color = Rc::clone(&state);
         let reapply_for_layer_color = Rc::clone(&reapply_generation);
@@ -1785,6 +1860,9 @@ fn default_accent() -> [u8; 3] {
 fn default_foreground_opacity() -> f32 {
     1.0
 }
+fn default_auto_contrast() -> bool {
+    true
+}
 fn default_tilt() -> bool {
     true
 }
@@ -1795,6 +1873,19 @@ fn normalize_model(model: String) -> String {
     } else {
         model.to_owned()
     }
+}
+
+fn application_matches_query(application: &DesktopApplication, query: &str) -> bool {
+    let query = query.trim().to_lowercase();
+    query.is_empty()
+        || [
+            application.name.as_str(),
+            application.id.as_str(),
+            application.icon_name.as_str(),
+            application.category.label(),
+        ]
+        .into_iter()
+        .any(|value| value.to_lowercase().contains(&query))
 }
 fn color_scheme(theme: ThemeChoice) -> adw::ColorScheme {
     match theme {
@@ -1830,17 +1921,11 @@ fn appearance_index(appearance: Appearance) -> u32 {
         .position(|candidate| *candidate == appearance)
         .unwrap_or(4) as u32
 }
-fn model_index(model: &str) -> u32 {
-    MODEL_OPTIONS
-        .iter()
-        .position(|candidate| *candidate == model)
-        .unwrap_or(0) as u32
-}
-
 #[cfg(test)]
 mod tests {
     use super::{
-        DesktopEnvironment, cached_svg_path, desktop_environment, preview_layer_from_selection,
+        AppCategory, DesktopApplication, DesktopEnvironment, application_matches_query,
+        cached_svg_path, desktop_environment, normalize_model, preview_layer_from_selection,
         preview_pointer,
     };
     use std::path::Path;
@@ -1879,5 +1964,27 @@ mod tests {
             DesktopEnvironment::Hyprland
         );
         assert_eq!(desktop_environment(None), DesktopEnvironment::Other);
+    }
+
+    #[test]
+    fn model_input_falls_back_only_when_empty() {
+        assert_eq!(normalize_model(" custom-model ".to_owned()), "custom-model");
+        assert_eq!(normalize_model("  ".to_owned()), super::DEFAULT_MODEL);
+    }
+
+    #[test]
+    fn application_search_matches_identity_and_category() {
+        let application = DesktopApplication {
+            id: "org.example.Editor.desktop".to_owned(),
+            name: "Example Editor".to_owned(),
+            desktop_file: Path::new("/tmp/example.desktop").to_owned(),
+            icon_name: "text-editor".to_owned(),
+            icon_path: None,
+            categories: Vec::new(),
+            category: AppCategory::Office,
+        };
+        assert!(application_matches_query(&application, "editor"));
+        assert!(application_matches_query(&application, "office"));
+        assert!(!application_matches_query(&application, "browser"));
     }
 }

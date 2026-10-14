@@ -34,8 +34,12 @@ runtime supports effects on/off, `off|automatic|inside|outside` specular,
 normalized blur/refraction/translucency/shadow, plus default Dark and Mono
 annotations. The GUI exposes the resulting material surfaces in **Inspect**.
 
-Accent and appearance are local WGPU inputs; updating either only regenerates
-the Linux PNG outputs. The renderer applies a single centered final mask to
+Accent, appearance, background override and automatic contrast are local WGPU
+inputs; updating them only regenerates the Linux PNG outputs. A flat background
+override is exact, while a source gradient preserves relative light/dark
+values. Automatic contrast chooses a local black, white or accent material
+colour only when a surface would blend into its background, and never overrides
+an explicit layer colour. The renderer applies a single centered final mask to
 the composite. It never modifies source artwork beforehand, so the same
 asymmetry and optical scale reach the installed icon.
 

@@ -1,0 +1,27 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <g id="background">
+    <rect x="0" y="0" width="1024" height="1024" fill="#000000"/>
+  </g>
+  <g id="group-1">
+    <g id="layer-1-1">
+      <path d="M458 53 L766 53 L970 369 L666 369 Z" fill="#087052" stroke="#e9eeec" stroke-width="4" stroke-linejoin="round"/>
+    </g>
+    <g id="layer-1-2">
+      <path d="M97 368 L420 75 L625 384 L375 630 L270 630 Z" fill="#087b50" stroke="#e9eeec" stroke-width="4" stroke-linejoin="round"/>
+    </g>
+    <g id="layer-1-3">
+      <path d="M72 615 L149 532 L204 615 Z" fill="#087052" stroke="#e9eeec" stroke-width="4" stroke-linejoin="round"/>
+    </g>
+    <g id="layer-1-4">
+      <path d="M802 404 L929 404 L858 485 Z" fill="#087052" stroke="#e9eeec" stroke-width="4" stroke-linejoin="round"/>
+    </g>
+  </g>
+  <g id="group-2">
+    <g id="layer-2-1">
+      <path d="M54 655 L358 655 L562 970 L260 970 Z" fill="#087b50" stroke="#e9eeec" stroke-width="4" stroke-linejoin="round"/>
+    </g>
+    <g id="layer-2-2">
+      <path d="M419 653 L666 406 L768 406 L946 673 L625 960 Z" fill="#087b50" stroke="#e9eeec" stroke-width="4" stroke-linejoin="round"/>
+    </g>
+  </g>
+</svg>

@@ -62,4 +62,9 @@ WGPU shader either materializes those surfaces individually or composites a
 Combined group once, then calculates the final icon mask, depth/parallax,
 refraction, specular response, shadow, Default/Dark transformation,
 Mono-derived Clear treatment and user-selected Tinted treatment. This stage
-performs no AI or network work.
+performs no AI or network work. It also applies the runtime-only visibility
+fallback: if a surface has insufficient contrast with its local background,
+the shader selects black, white or the global accent for that surface. An
+explicit surface colour wins, and the canonical SVG/manifest remain unchanged.
+The preview and installed PNG use the same final rounded-square mask at the
+renderer boundary, so their corner radius does not depend on GTK widget CSS.

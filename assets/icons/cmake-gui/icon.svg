@@ -1,0 +1,28 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <g id="background">
+    <rect x="0" y="0" width="1024" height="1024" fill="#000000"/>
+  </g>
+  <g id="group-1">
+    <g id="layer-1-1">
+      <path d="M0 1018 L320 734 L1024 1018 L1024 1024 L0 1024 Z" fill="#209c4b" stroke="#050505" stroke-width="5" stroke-linejoin="round"/>
+    </g>
+  </g>
+  <g id="group-2">
+    <g id="layer-2-1">
+      <path d="M2 1004 L501 0 L553 538 L2 1004 Z" fill="#0e5b95" stroke="#050505" stroke-width="5" stroke-linejoin="round"/>
+    </g>
+  </g>
+  <g id="group-3">
+    <g id="layer-3-1">
+      <path d="M510 0 L1024 1018 L581 837 Z" fill="#c91e2c" stroke="#050505" stroke-width="5" stroke-linejoin="round"/>
+    </g>
+  </g>
+  <g id="group-4">
+    <g id="layer-4-1">
+      <path d="M320 735 L554 537 L581 837 Z" fill="#cfcfcf" stroke="#050505" stroke-width="5" stroke-linejoin="round"/>
+    </g>
+    <g id="layer-4-2">
+      <path d="M401 0 C401 4 405 7 410 7 L478 7 C483 7 486 4 486 0 Z" fill="#ffffff"/>
+    </g>
+  </g>
+</svg>
